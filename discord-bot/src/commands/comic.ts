@@ -1,5 +1,6 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, ChannelType } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, ChannelType, TextChannel } from 'discord.js';
 import { getUser, updateUser, getConfig } from '../db';
+import { StoryGenerator } from '../logic/StoryGenerator';
 
 export const data = new SlashCommandBuilder()
     .setName('comic')
@@ -25,6 +26,7 @@ export const data = new SlashCommandBuilder()
                         { name: 'Custom', value: 'Custom' }
                     )
             )
+            .addAttachmentOption(option => option.setName('costar').setDescription('Optional: Villain or Co-Star Image').setRequired(false))
     )
     .addSubcommand(sub =>
         sub
@@ -64,50 +66,45 @@ export async function execute(interaction: ChatInputCommandInteraction) {
             return;
         }
 
-        // 2. Create Webhook for this channel (if possible) or use interaction response
-        // For the "Live Stream" feature, we need a Webhook URL to pass to the Web App.
-        let webhookUrl = "";
-        if (interaction.channel && interaction.channel.type === ChannelType.GuildText) {
-            try {
-                const webhooks = await interaction.channel.fetchWebhooks();
-                let hook = webhooks.find(w => w.name === 'Infinite Heroes Bot');
-                if (!hook) {
-                    hook = await interaction.channel.createWebhook({
-                        name: 'Infinite Heroes Bot',
-                        avatar: interaction.client.user?.displayAvatarURL(),
-                    });
-                }
-                webhookUrl = hook.url;
-            } catch (e) {
-                console.error("Failed to create webhook", e);
-                // Fallback: We can't stream if we can't make a webhook, but we can still generate.
-            }
+        const image = interaction.options.getAttachment('image', true);
+        const costar = interaction.options.getAttachment('costar', false);
+        const genre = interaction.options.getString('genre', true);
+        
+        // 2. Validate Channel
+        if (!interaction.channel || interaction.channel.type !== ChannelType.GuildText) {
+            await interaction.reply({ content: "❌ This command can only be used in text channels.", ephemeral: true });
+            return;
         }
 
-        // 3. Generate Magic Link
-        const image = interaction.options.getAttachment('image', true);
-        const genre = interaction.options.getString('genre', true);
-        const baseUrl = process.env.WEB_APP_URL || 'http://localhost:5173';
-        
-        const params = new URLSearchParams();
-        params.append('hero_url', image.url);
-        params.append('genre', genre);
-        if (webhookUrl) params.append('webhook', webhookUrl);
+        // 3. Acknowledge
+        await interaction.reply({ 
+            content: `⚡ **Initializing Infinite Heroes Generator...**\n**Genre:** ${genre}\n**Hero:** Uploaded\n**Co-Star:** ${costar ? 'Uploaded' : 'None'}\n\n*Generating Page 1... (This may take 10-20 seconds)*`, 
+            ephemeral: false 
+        });
 
-        const magicLink = `${baseUrl}/?${params.toString()}`;
+        // 4. Start Generation
+        try {
+            const generator = new StoryGenerator(
+                process.env.GEMINI_KEY || '', 
+                image.url, 
+                costar ? costar.url : null, 
+                genre, 
+                interaction.channel as TextChannel, 
+                interaction.user
+            );
 
-        // 4. Update User State
-        await updateUser(interaction.user.id, { last_generation: now });
+            // Fire and forget - the generator handles the rest
+            generator.start().catch(err => {
+                console.error("Generation Error:", err);
+                interaction.followUp({ content: `❌ **Generation Failed:** ${err.message}`, ephemeral: true });
+            });
 
-        // 5. Reply
-        const embed = new EmbedBuilder()
-            .setTitle("⚡ Infinite Heroes Generator")
-            .setDescription(`Your custom **${genre}** comic is ready to be forged!`)
-            .addFields({ name: "Magic Link", value: `[Click here to Start Generation](${magicLink})` })
-            .setImage(image.url)
-            .setColor(0xFFD700)
-            .setFooter({ text: "Clicking the link will open the Web App and start the live stream in this channel." });
+            // Update User State
+            await updateUser(interaction.user.id, { last_generation: now });
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        } catch (error) {
+            console.error(error);
+            await interaction.followUp({ content: "❌ Failed to start generation process.", ephemeral: true });
+        }
     }
 }

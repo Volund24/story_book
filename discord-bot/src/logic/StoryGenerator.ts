@@ -3,6 +3,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, EmbedBuild
 import PDFDocument from 'pdfkit';
 import axios from 'axios';
 import { Readable } from 'stream';
+import Jimp from 'jimp';
 
 // --- Constants ---
 const MAX_STORY_PAGES = 10;
@@ -390,7 +391,18 @@ OUTPUT STRICT JSON ONLY:
         
         for (const face of sortedFaces) {
             if (!face.imageUrl) continue;
-            const imgBuffer = Buffer.from(face.imageUrl.split(',')[1], 'base64');
+            let imgBuffer = Buffer.from(face.imageUrl.split(',')[1], 'base64');
+            
+            try {
+                // Compress image using Jimp to reduce PDF size
+                const image = await Jimp.read(imgBuffer);
+                image.resize(600, Jimp.AUTO); // Resize width to 600px
+                image.quality(60); // Set JPEG quality to 60%
+                imgBuffer = await image.getBufferAsync(Jimp.MIME_JPEG) as Buffer;
+            } catch (e) {
+                console.error("Error compressing image:", e);
+                // Fallback to original buffer if compression fails
+            }
             
             doc.addPage({ size: [480, 720], margin: 0 });
             doc.image(imgBuffer, 0, 0, { width: 480, height: 720 });

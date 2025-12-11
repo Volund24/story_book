@@ -9,11 +9,15 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@google/genai": "^1.33.0",
+    "@types/pdfkit": "^0.17.4",
+    "axios": "^1.13.2",
+    "jimp": "^0.22.12",
+    "jspdf": "^3.0.3",
+    "pdfkit": "^0.17.2",
     "react": "^19.2.0",
-    "@google/genai": "^1.27.0",
     "react-dom": "^19.2.0",
-    "recharts": "^3.3.0",
-    "jspdf": "^3.0.3"
+    "recharts": "^3.3.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

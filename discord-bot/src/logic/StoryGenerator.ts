@@ -398,7 +398,7 @@ OUTPUT STRICT JSON ONLY:
                 const image = await Jimp.read(imgBuffer);
                 image.resize(600, Jimp.AUTO); // Resize width to 600px
                 image.quality(60); // Set JPEG quality to 60%
-                imgBuffer = await image.getBufferAsync(Jimp.MIME_JPEG) as Buffer;
+                imgBuffer = await image.getBufferAsync(Jimp.MIME_JPEG) as unknown as Buffer;
             } catch (e) {
                 console.error("Error compressing image:", e);
                 // Fallback to original buffer if compression fails

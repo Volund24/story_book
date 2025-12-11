@@ -1,8 +1,8 @@
 # Build Stage
-FROM node:18-alpine AS builder
+FROM node:20-alpine AS builder
 
 # Install build dependencies for sqlite3
-RUN apk add --no-cache python3 make g++
+RUN apk add --no-cache python3 make g++ py3-setuptools
 
 WORKDIR /app
 
@@ -14,7 +14,7 @@ RUN npm ci
 RUN npm run build
 
 # Production Stage
-FROM node:18-alpine
+FROM node:20-alpine
 
 WORKDIR /app
 

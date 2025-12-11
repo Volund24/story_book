@@ -1,5 +1,3 @@
-import sqlite3 from 'sqlite3';
-import { open, Database } from 'sqlite';
 import { Pool } from 'pg';
 import { resolve4 } from 'dns/promises';
 import { URL } from 'url';
@@ -17,9 +15,12 @@ let adapter: DBAdapter;
 
 // --- SQLite Adapter ---
 class SQLiteAdapter implements DBAdapter {
-    private db!: Database;
+    private db!: any;
 
     async init() {
+        const sqlite3 = (await import('sqlite3')).default;
+        const { open } = await import('sqlite');
+
         this.db = await open({
             filename: './database.sqlite',
             driver: sqlite3.Database

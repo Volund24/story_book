@@ -8,7 +8,7 @@ import { Readable } from 'stream';
 const MAX_STORY_PAGES = 10;
 const BACK_COVER_PAGE = 11;
 const TOTAL_PAGES = 11;
-const DECISION_PAGES = [3];
+const DECISION_PAGES: number[] = []; // No interactive pauses
 const MODEL_V3 = "gemini-3-pro-image-preview";
 const MODEL_IMAGE_GEN_NAME = MODEL_V3;
 const MODEL_TEXT_NAME = MODEL_V3;
@@ -108,19 +108,14 @@ export class StoryGenerator {
         // 2. Generate Cover
         await this.generateSinglePage(0, 'cover');
 
-        // 3. Generate Initial Batch (Pages 1-3)
-        for (let i = 1; i <= 3; i++) {
+        // 3. Generate All Pages (Linear Flow)
+        for (let i = 1; i <= MAX_STORY_PAGES; i++) {
             await this.generateSinglePage(i, 'story');
         }
 
-        // 4. Interactive Decision (Page 3 is usually the decision page)
-        const decisionPage = this.history.find(f => f.pageIndex === 3);
-        if (decisionPage && decisionPage.choices && decisionPage.choices.length > 0) {
-            await this.handleDecision(decisionPage);
-        } else {
-            // Fallback if no choices generated
-            await this.continueGeneration(4);
-        }
+        // 4. Back Cover & PDF
+        await this.generateSinglePage(BACK_COVER_PAGE, 'back_cover');
+        await this.generateAndUploadPDF();
     }
 
     private async handleDecision(page: ComicFace) {

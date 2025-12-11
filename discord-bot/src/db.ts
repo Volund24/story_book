@@ -1,6 +1,8 @@
 import sqlite3 from 'sqlite3';
 import { open, Database } from 'sqlite';
 import { Pool } from 'pg';
+import { resolve4 } from 'dns/promises';
+import { URL } from 'url';
 
 // Interface for DB operations
 interface DBAdapter {
@@ -71,13 +73,32 @@ class SQLiteAdapter implements DBAdapter {
 
 // --- Postgres Adapter ---
 class PostgresAdapter implements DBAdapter {
-    private pool: Pool;
+    private pool!: Pool;
+    private connectionString: string;
 
     constructor(connectionString: string) {
-        this.pool = new Pool({ connectionString });
+        this.connectionString = connectionString;
     }
 
     async init() {
+        try {
+            const url = new URL(this.connectionString);
+            const hostname = url.hostname;
+            // Simple check to skip if it looks like an IP
+            if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) {
+                const addresses = await resolve4(hostname);
+                if (addresses.length > 0) {
+                    console.log(`Resolved ${hostname} to ${addresses[0]}`);
+                    url.hostname = addresses[0];
+                    this.connectionString = url.toString();
+                }
+            }
+        } catch (error) {
+            console.warn('DNS resolution failed, using original connection string:', error);
+        }
+
+        this.pool = new Pool({ connectionString: this.connectionString });
+
         await this.pool.query(`
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,

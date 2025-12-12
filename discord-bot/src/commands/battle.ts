@@ -1,0 +1,180 @@
+import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, TextChannel } from 'discord.js';
+import { getUser, updateUser, getConfig } from '../db';
+
+// In-memory lobby state (for now, could be DB later)
+interface Lobby {
+    hostId: string;
+    channelId: string;
+    players: Player[];
+    maxPlayers: number;
+    status: 'OPEN' | 'IN_PROGRESS' | 'COMPLETED';
+    settings: {
+        arena: string;
+        genre: string;
+        registrationType: 'UPLOAD' | 'PFP' | 'WALLET';
+    };
+}
+
+interface Player {
+    id: string;
+    username: string;
+    avatarUrl: string;
+    isOnline: boolean;
+}
+
+const activeLobbies: Map<string, Lobby> = new Map(); // Key: ChannelID
+
+export const data = new SlashCommandBuilder()
+    .setName('battle')
+    .setDescription('Infinite Heroes Battle Royale')
+    .addSubcommand(sub =>
+        sub
+            .setName('create')
+            .setDescription('Start a new Battle Lobby')
+            .addIntegerOption(opt => opt.setName('players').setDescription('Max Players (2-16)').setMinValue(2).setMaxValue(16).setRequired(true))
+            .addStringOption(opt => 
+                opt.setName('type')
+                    .setDescription('Registration Type')
+                    .setRequired(true)
+                    .addChoices(
+                        { name: 'Image Upload', value: 'UPLOAD' },
+                        { name: 'Discord PFP', value: 'PFP' },
+                        { name: 'Solana Wallet (Coming Soon)', value: 'WALLET' }
+                    )
+            )
+            .addStringOption(opt => opt.setName('arena').setDescription('Battle Arena/Theme').setRequired(false))
+    )
+    .addSubcommand(sub =>
+        sub
+            .setName('join')
+            .setDescription('Join the current lobby')
+            .addAttachmentOption(opt => opt.setName('image').setDescription('Your Character Image (Required for UPLOAD type)').setRequired(false))
+    )
+    .addSubcommand(sub =>
+        sub
+            .setName('start')
+            .setDescription('Start the Battle (Host Only)')
+    );
+
+export async function execute(interaction: ChatInputCommandInteraction) {
+    const subcommand = interaction.options.getSubcommand();
+    const channelId = interaction.channelId;
+
+    if (subcommand === 'create') {
+        if (activeLobbies.has(channelId)) {
+            await interaction.reply({ content: "❌ A lobby is already active in this channel!", ephemeral: true });
+            return;
+        }
+
+        const maxPlayers = interaction.options.getInteger('players', true);
+        const regType = interaction.options.getString('type', true) as 'UPLOAD' | 'PFP' | 'WALLET';
+        const arena = interaction.options.getString('arena') || 'The Void';
+
+        const lobby: Lobby = {
+            hostId: interaction.user.id,
+            channelId: channelId,
+            players: [],
+            maxPlayers: maxPlayers,
+            status: 'OPEN',
+            settings: {
+                arena: arena,
+                genre: 'Action', // Default, host can change later?
+                registrationType: regType
+            }
+        };
+
+        // Auto-register the host
+        let hostAvatar = interaction.user.displayAvatarURL({ extension: 'png', size: 512 });
+        // If UPLOAD type, host needs to join manually or we default to PFP for now
+        if (regType === 'PFP') {
+             lobby.players.push({
+                id: interaction.user.id,
+                username: interaction.user.username,
+                avatarUrl: hostAvatar,
+                isOnline: true
+            });
+        }
+
+        activeLobbies.set(channelId, lobby);
+
+        const embed = new EmbedBuilder()
+            .setTitle(`⚔️ BATTLE ROYALE: ${arena}`)
+            .setDescription(`**Host:** ${interaction.user.username}\n**Mode:** ${regType}\n**Players:** ${lobby.players.length}/${maxPlayers}\n\nType \`/battle join\` to enter!`)
+            .setColor(0xFFD700);
+
+        await interaction.reply({ embeds: [embed] });
+        return;
+    }
+
+    if (subcommand === 'join') {
+        const lobby = activeLobbies.get(channelId);
+        if (!lobby || lobby.status !== 'OPEN') {
+            await interaction.reply({ content: "❌ No open lobby in this channel.", ephemeral: true });
+            return;
+        }
+
+        if (lobby.players.find(p => p.id === interaction.user.id)) {
+            await interaction.reply({ content: "⚠️ You are already registered!", ephemeral: true });
+            return;
+        }
+
+        if (lobby.players.length >= lobby.maxPlayers) {
+            await interaction.reply({ content: "❌ Lobby is full!", ephemeral: true });
+            return;
+        }
+
+        let avatarUrl = interaction.user.displayAvatarURL({ extension: 'png', size: 512 });
+        
+        if (lobby.settings.registrationType === 'UPLOAD') {
+            const attachment = interaction.options.getAttachment('image');
+            if (!attachment) {
+                await interaction.reply({ content: "❌ You must upload an image to join this battle!", ephemeral: true });
+                return;
+            }
+            avatarUrl = attachment.url;
+        }
+
+        lobby.players.push({
+            id: interaction.user.id,
+            username: interaction.user.username,
+            avatarUrl: avatarUrl,
+            isOnline: true // Assume online if they just typed the command
+        });
+
+        await interaction.reply({ content: `✅ **${interaction.user.username}** has entered the arena! (${lobby.players.length}/${lobby.maxPlayers})` });
+        
+        // Check if full
+        if (lobby.players.length === lobby.maxPlayers) {
+            const host = await interaction.client.users.fetch(lobby.hostId);
+            await interaction.followUp(`📢 **Lobby Full!** ${host.toString()}, type \`/battle start\` to begin!`);
+        }
+        return;
+    }
+
+    if (subcommand === 'start') {
+        const lobby = activeLobbies.get(channelId);
+        if (!lobby) {
+            await interaction.reply({ content: "❌ No lobby found.", ephemeral: true });
+            return;
+        }
+
+        if (interaction.user.id !== lobby.hostId) {
+            await interaction.reply({ content: "❌ Only the Host can start the battle.", ephemeral: true });
+            return;
+        }
+
+        if (lobby.players.length < 2) {
+            await interaction.reply({ content: "❌ Need at least 2 players to start.", ephemeral: true });
+            return;
+        }
+
+        lobby.status = 'IN_PROGRESS';
+        await interaction.reply({ content: `🔥 **THE BATTLE BEGINS!**\nArena: ${lobby.settings.arena}\nFighters: ${lobby.players.map(p => p.username).join(', ')}` });
+
+        // TODO: Trigger the Battle Engine here
+        // await startBattle(lobby);
+        
+        // Cleanup for now
+        activeLobbies.delete(channelId);
+    }
+}

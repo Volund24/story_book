@@ -2,12 +2,14 @@ import { REST, Routes } from 'discord.js';
 import * as dotenv from 'dotenv';
 import * as comicCommand from './commands/comic';
 import * as adminCommand from './commands/admin';
+import * as battleCommand from './commands/battle';
 
 dotenv.config();
 
 const commands = [
     comicCommand.data.toJSON(),
-    adminCommand.data.toJSON()
+    adminCommand.data.toJSON(),
+    battleCommand.data.toJSON()
 ];
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN!);

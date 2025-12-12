@@ -3,6 +3,7 @@ import * as dotenv from 'dotenv';
 import { initDB } from './db';
 import * as comicCommand from './commands/comic';
 import * as adminCommand from './commands/admin';
+import * as battleCommand from './commands/battle';
 
 dotenv.config();
 
@@ -12,6 +13,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const commands = new Collection<string, any>();
 commands.set(comicCommand.data.name, comicCommand);
 commands.set(adminCommand.data.name, adminCommand);
+commands.set(battleCommand.data.name, battleCommand);
 
 client.once(Events.ClientReady, async c => {
     console.log(`Ready! Logged in as ${c.user.tag}`);

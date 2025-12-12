@@ -97,9 +97,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
         activeLobbies.set(channelId, lobby);
 
+        const playerList = lobby.players.length > 0 ? `**1.** ${lobby.players[0].username}` : 'Waiting for players...';
+
         const embed = new EmbedBuilder()
             .setTitle(`⚔️ BATTLE ROYALE: ${arena}`)
-            .setDescription(`**Host:** ${interaction.user.username}\n**Mode:** ${regType}\n**Players:** ${lobby.players.length}/${maxPlayers}\n\nType \`/battle join\` to enter!`)
+            .setDescription(`**Host:** ${interaction.user.username}\n**Mode:** ${regType}\n**Players:** ${lobby.players.length}/${maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
             .setColor(0xFFD700);
 
         await interaction.reply({ embeds: [embed] });
@@ -141,7 +143,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
             isOnline: true // Assume online if they just typed the command
         });
 
-        await interaction.reply({ content: `✅ **${interaction.user.username}** has entered the arena! (${lobby.players.length}/${lobby.maxPlayers})` });
+        // Update the lobby embed
+        const playerList = lobby.players.map((p, i) => `**${i + 1}.** ${p.username}`).join('\n');
+        const updateEmbed = new EmbedBuilder()
+            .setTitle(`⚔️ BATTLE ROYALE: ${lobby.settings.arena}`)
+            .setDescription(`**Host:** <@${lobby.hostId}>\n**Mode:** ${lobby.settings.registrationType}\n**Players:** ${lobby.players.length}/${lobby.maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
+            .setColor(0xFFD700)
+            .setThumbnail(lobby.players[0].avatarUrl); // Show host avatar as thumbnail
+
+        await interaction.reply({ embeds: [updateEmbed] });
         
         // Check if full
         if (lobby.players.length === lobby.maxPlayers) {

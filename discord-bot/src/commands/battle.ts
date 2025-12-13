@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, TextChannel } from 'discord.js';
 import { getUser, updateUser, getConfig } from '../db';
+import { verifyWalletAndGetNFT } from '../logic/SolanaVerifier';
 
 // In-memory lobby state (for now, could be DB later)
 interface Lobby {
@@ -20,6 +21,8 @@ interface Player {
     username: string;
     avatarUrl: string;
     isOnline: boolean;
+    walletAddress?: string;
+    nftAttributes?: any[];
 }
 
 const activeLobbies: Map<string, Lobby> = new Map(); // Key: ChannelID
@@ -39,7 +42,7 @@ export const data = new SlashCommandBuilder()
                     .addChoices(
                         { name: 'Image Upload', value: 'UPLOAD' },
                         { name: 'Discord PFP', value: 'PFP' },
-                        { name: 'Solana Wallet (Coming Soon)', value: 'WALLET' }
+                        { name: 'Solana Wallet', value: 'WALLET' }
                     )
             )
             .addStringOption(opt => opt.setName('arena').setDescription('Battle Arena/Theme').setRequired(false))
@@ -49,16 +52,42 @@ export const data = new SlashCommandBuilder()
             .setName('join')
             .setDescription('Join the current lobby')
             .addAttachmentOption(opt => opt.setName('image').setDescription('Your Character Image (Required for UPLOAD type)').setRequired(false))
+            .addStringOption(opt => opt.setName('wallet').setDescription('Your Solana Wallet Address (Required for WALLET type)').setRequired(false))
     )
     .addSubcommand(sub =>
         sub
             .setName('start')
             .setDescription('Start the Battle (Host Only)')
+    )
+    .addSubcommand(sub =>
+        sub
+            .setName('reset')
+            .setDescription('Force reset the lobby in this channel (Host/Admin Only)')
     );
 
 export async function execute(interaction: ChatInputCommandInteraction) {
     const subcommand = interaction.options.getSubcommand();
     const channelId = interaction.channelId;
+
+    if (subcommand === 'reset') {
+        const lobby = activeLobbies.get(channelId);
+        if (!lobby) {
+            await interaction.reply({ content: "ℹ️ No active lobby to reset.", ephemeral: true });
+            return;
+        }
+
+        // Check permissions (Host or Admin)
+        // Note: For now, we just check if they are the host. 
+        // Real admin check would require checking interaction.member.permissions
+        if (interaction.user.id !== lobby.hostId) {
+             await interaction.reply({ content: "❌ Only the Host can reset the lobby.", ephemeral: true });
+             return;
+        }
+
+        activeLobbies.delete(channelId);
+        await interaction.reply({ content: "🗑️ **Lobby has been reset.** You can now create a new one." });
+        return;
+    }
 
     if (subcommand === 'create') {
         if (activeLobbies.has(channelId)) {
@@ -126,6 +155,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         }
 
         let avatarUrl = interaction.user.displayAvatarURL({ extension: 'png', size: 512 });
+        let walletAddress: string | undefined;
+        let nftAttributes: any[] | undefined;
         
         if (lobby.settings.registrationType === 'UPLOAD') {
             const attachment = interaction.options.getAttachment('image');
@@ -134,13 +165,57 @@ export async function execute(interaction: ChatInputCommandInteraction) {
                 return;
             }
             avatarUrl = attachment.url;
+        } else if (lobby.settings.registrationType === 'WALLET') {
+            const wallet = interaction.options.getString('wallet');
+            if (!wallet) {
+                await interaction.reply({ content: "❌ You must provide a Solana Wallet Address!", ephemeral: true });
+                return;
+            }
+            
+            await interaction.deferReply(); // Verification might take a moment
+            
+            const nftData = await verifyWalletAndGetNFT(wallet);
+            if (!nftData) {
+                await interaction.editReply({ content: "❌ No valid NFT found in this wallet! (Must be a single NFT, not a token)" });
+                return;
+            }
+            
+            avatarUrl = nftData.image;
+            walletAddress = wallet;
+            nftAttributes = nftData.attributes;
+            
+            // Resume normal flow (but use editReply instead of reply)
+            lobby.players.push({
+                id: interaction.user.id,
+                username: interaction.user.username,
+                avatarUrl: avatarUrl,
+                isOnline: true,
+                walletAddress,
+                nftAttributes
+            });
+
+            const playerList = lobby.players.map((p, i) => `**${i + 1}.** ${p.username}`).join('\n');
+            const updateEmbed = new EmbedBuilder()
+                .setTitle(`⚔️ BATTLE ROYALE: ${lobby.settings.arena}`)
+                .setDescription(`**Host:** <@${lobby.hostId}>\n**Mode:** ${lobby.settings.registrationType}\n**Players:** ${lobby.players.length}/${lobby.maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
+                .setColor(0xFFD700)
+                .setThumbnail(lobby.players[0].avatarUrl);
+
+            await interaction.editReply({ embeds: [updateEmbed] });
+            
+            if (lobby.players.length === lobby.maxPlayers) {
+                const host = await interaction.client.users.fetch(lobby.hostId);
+                await interaction.followUp(`📢 **Lobby Full!** ${host.toString()}, type \`/battle start\` to begin!`);
+            }
+            return;
         }
 
+        // Default PFP or UPLOAD flow (non-wallet)
         lobby.players.push({
             id: interaction.user.id,
             username: interaction.user.username,
             avatarUrl: avatarUrl,
-            isOnline: true // Assume online if they just typed the command
+            isOnline: true
         });
 
         // Update the lobby embed

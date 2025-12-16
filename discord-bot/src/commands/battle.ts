@@ -1,6 +1,29 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, TextChannel } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, TextChannel, User, Attachment, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ModalSubmitInteraction, StringSelectMenuInteraction } from 'discord.js';
 import { getUser, updateUser, getConfig } from '../db';
-import { verifyWalletAndGetNFT } from '../logic/SolanaVerifier';
+import { verifyWalletAndGetNFTs, NFTData } from '../logic/SolanaVerifier';
+import { BattleManager } from '../logic/BattleManager';
+
+// Custom Error for Multiple NFTs
+class MultipleNFTsError extends Error {
+    nfts: NFTData[];
+    wallet: string;
+    constructor(nfts: NFTData[], wallet: string) {
+        super("Multiple NFTs found");
+        this.nfts = nfts;
+        this.wallet = wallet;
+    }
+}
+
+// Custom Error for Multiple Collections
+class MultipleCollectionsError extends Error {
+    groups: string[];
+    wallet: string;
+    constructor(groups: string[], wallet: string) {
+        super("Multiple Collections found");
+        this.groups = groups;
+        this.wallet = wallet;
+    }
+}
 
 // In-memory lobby state (for now, could be DB later)
 interface Lobby {
@@ -26,6 +49,77 @@ interface Player {
 }
 
 const activeLobbies: Map<string, Lobby> = new Map(); // Key: ChannelID
+const activeBattles: Map<string, BattleManager> = new Map(); // Key: ChannelID
+
+async function validateAndGetPlayerData(
+    user: User,
+    type: 'UPLOAD' | 'PFP' | 'WALLET',
+    options: { image?: Attachment, wallet?: string, selectedMint?: string, selectedCollectionGroup?: string }
+): Promise<Player> {
+    let avatarUrl = user.displayAvatarURL({ extension: 'png', size: 512 });
+    let walletAddress: string | undefined;
+    let nftAttributes: any[] | undefined;
+
+    if (type === 'UPLOAD') {
+        if (!options.image) throw new Error("You must upload an image!");
+        avatarUrl = options.image.url;
+    } else if (type === 'WALLET') {
+        // Check if wallet is provided OR in DB
+        let walletToUse = options.wallet;
+        if (!walletToUse) {
+            const dbUser = await getUser(user.id);
+            if (dbUser && dbUser.wallet_address) {
+                walletToUse = dbUser.wallet_address;
+            }
+        }
+
+        if (!walletToUse) throw new Error("You must provide a Solana Wallet Address (or set it via /wallet set)!");
+        
+        const nfts = await verifyWalletAndGetNFTs(walletToUse);
+        if (nfts.length === 0) throw new Error("No valid NFT found in this wallet! (Must be a single NFT, not a token)");
+        
+        let filteredNFTs = nfts;
+
+        // Check for multiple collections
+        const enablePartners = await getConfig('enable_partners') === 'true';
+        if (enablePartners) {
+            // Get unique groups from the NFTs found in wallet
+            const groups = Array.from(new Set(nfts.map(n => n.collectionGroup || 'Unknown'))).filter(g => g !== 'Unknown');
+            
+            if (options.selectedCollectionGroup) {
+                filteredNFTs = nfts.filter(n => n.collectionGroup === options.selectedCollectionGroup);
+                if (filteredNFTs.length === 0) throw new Error("No NFTs found in the selected collection.");
+            } else if (groups.length > 1) {
+                // If user has NFTs from multiple configured collections, ask them to choose
+                throw new MultipleCollectionsError(groups, walletToUse);
+            }
+        }
+
+        let selectedNFT: NFTData;
+
+        if (options.selectedMint) {
+            const found = filteredNFTs.find(n => n.mint === options.selectedMint);
+            if (!found) throw new Error("Selected NFT not found in wallet (or verification failed).");
+            selectedNFT = found;
+        } else {
+            // Pick a random NFT from the valid ones (filtered by collection if applicable)
+            selectedNFT = filteredNFTs[Math.floor(Math.random() * filteredNFTs.length)];
+        }
+        
+        avatarUrl = selectedNFT.image;
+        walletAddress = walletToUse;
+        nftAttributes = selectedNFT.attributes;
+    }
+
+    return {
+        id: user.id,
+        username: user.username,
+        avatarUrl,
+        isOnline: true,
+        walletAddress,
+        nftAttributes
+    };
+}
 
 export const data = new SlashCommandBuilder()
     .setName('battle')
@@ -33,19 +127,7 @@ export const data = new SlashCommandBuilder()
     .addSubcommand(sub =>
         sub
             .setName('create')
-            .setDescription('Start a new Battle Lobby')
-            .addIntegerOption(opt => opt.setName('players').setDescription('Max Players (2-16)').setMinValue(2).setMaxValue(16).setRequired(true))
-            .addStringOption(opt => 
-                opt.setName('type')
-                    .setDescription('Registration Type')
-                    .setRequired(true)
-                    .addChoices(
-                        { name: 'Image Upload', value: 'UPLOAD' },
-                        { name: 'Discord PFP', value: 'PFP' },
-                        { name: 'Solana Wallet', value: 'WALLET' }
-                    )
-            )
-            .addStringOption(opt => opt.setName('arena').setDescription('Battle Arena/Theme').setRequired(false))
+            .setDescription('Start a new Battle Lobby (Opens Wizard)')
     )
     .addSubcommand(sub =>
         sub
@@ -76,9 +158,6 @@ export async function execute(interaction: ChatInputCommandInteraction) {
             return;
         }
 
-        // Check permissions (Host or Admin)
-        // Note: For now, we just check if they are the host. 
-        // Real admin check would require checking interaction.member.permissions
         if (interaction.user.id !== lobby.hostId) {
              await interaction.reply({ content: "❌ Only the Host can reset the lobby.", ephemeral: true });
              return;
@@ -95,45 +174,23 @@ export async function execute(interaction: ChatInputCommandInteraction) {
             return;
         }
 
-        const maxPlayers = interaction.options.getInteger('players', true);
-        const regType = interaction.options.getString('type', true) as 'UPLOAD' | 'PFP' | 'WALLET';
-        const arena = interaction.options.getString('arena') || 'The Void';
+        // Step 1: Select Menu for Type
+        const select = new StringSelectMenuBuilder()
+            .setCustomId('battle_create_type')
+            .setPlaceholder('Select Registration Mode')
+            .addOptions(
+                { label: 'Solana Wallet (NFT)', value: 'WALLET', description: 'Use an NFT from your wallet', emoji: '💳' },
+                { label: 'Discord PFP', value: 'PFP', description: 'Use your Discord Profile Picture', emoji: '🖼️' },
+                { label: 'Image Upload', value: 'UPLOAD', description: 'Upload a custom image', emoji: '📤' },
+            );
 
-        const lobby: Lobby = {
-            hostId: interaction.user.id,
-            channelId: channelId,
-            players: [],
-            maxPlayers: maxPlayers,
-            status: 'OPEN',
-            settings: {
-                arena: arena,
-                genre: 'Action', // Default, host can change later?
-                registrationType: regType
-            }
-        };
+        const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
 
-        // Auto-register the host
-        let hostAvatar = interaction.user.displayAvatarURL({ extension: 'png', size: 512 });
-        // If UPLOAD type, host needs to join manually or we default to PFP for now
-        if (regType === 'PFP') {
-             lobby.players.push({
-                id: interaction.user.id,
-                username: interaction.user.username,
-                avatarUrl: hostAvatar,
-                isOnline: true
-            });
-        }
-
-        activeLobbies.set(channelId, lobby);
-
-        const playerList = lobby.players.length > 0 ? `**1.** ${lobby.players[0].username}` : 'Waiting for players...';
-
-        const embed = new EmbedBuilder()
-            .setTitle(`⚔️ BATTLE ROYALE: ${arena}`)
-            .setDescription(`**Host:** ${interaction.user.username}\n**Mode:** ${regType}\n**Players:** ${lobby.players.length}/${maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
-            .setColor(0xFFD700);
-
-        await interaction.reply({ embeds: [embed] });
+        await interaction.reply({ 
+            content: "⚔️ **Create Battle Lobby**\nSelect how players will register:", 
+            components: [row],
+            ephemeral: true 
+        });
         return;
     }
 
@@ -154,50 +211,60 @@ export async function execute(interaction: ChatInputCommandInteraction) {
             return;
         }
 
-        let avatarUrl = interaction.user.displayAvatarURL({ extension: 'png', size: 512 });
-        let walletAddress: string | undefined;
-        let nftAttributes: any[] | undefined;
-        
-        if (lobby.settings.registrationType === 'UPLOAD') {
-            const attachment = interaction.options.getAttachment('image');
-            if (!attachment) {
-                await interaction.reply({ content: "❌ You must upload an image to join this battle!", ephemeral: true });
-                return;
+        await interaction.deferReply();
+
+        try {
+            let player: Player;
+            try {
+                player = await validateAndGetPlayerData(interaction.user, lobby.settings.registrationType, {
+                    image: interaction.options.getAttachment('image') || undefined,
+                    wallet: interaction.options.getString('wallet') || undefined
+                });
+            } catch (error) {
+                if (error instanceof MultipleCollectionsError) {
+                    // Show Select Menu for Collections
+                    const select = new StringSelectMenuBuilder()
+                        .setCustomId('battle_join_collection_select')
+                        .setPlaceholder('Select a Collection')
+                        .addOptions(error.groups.map(g => ({ label: g, value: g })));
+                    
+                    const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+                    
+                    const response = await interaction.editReply({
+                        content: "⚠️ **Multiple Collections Found!**\nPlease select which collection you want to use:",
+                        components: [row]
+                    });
+
+                    try {
+                        const confirmation = await response.awaitMessageComponent({ filter: i => i.user.id === interaction.user.id, time: 60000, componentType: ComponentType.StringSelect });
+                        
+                        const selectedGroup = (confirmation as StringSelectMenuInteraction).values[0];
+                        await confirmation.update({ content: `✅ Selected **${selectedGroup}**. Entering arena...`, components: [] });
+                        
+                        player = await validateAndGetPlayerData(interaction.user, lobby.settings.registrationType, {
+                            image: interaction.options.getAttachment('image') || undefined,
+                            wallet: interaction.options.getString('wallet') || undefined,
+                            selectedCollectionGroup: selectedGroup
+                        });
+                    } catch (e) {
+                        await interaction.editReply({ content: "❌ Selection timed out or failed.", components: [] });
+                        return;
+                    }
+                } else {
+                    throw error;
+                }
             }
-            avatarUrl = attachment.url;
-        } else if (lobby.settings.registrationType === 'WALLET') {
-            const wallet = interaction.options.getString('wallet');
-            if (!wallet) {
-                await interaction.reply({ content: "❌ You must provide a Solana Wallet Address!", ephemeral: true });
-                return;
-            }
-            
-            await interaction.deferReply(); // Verification might take a moment
-            
-            const nftData = await verifyWalletAndGetNFT(wallet);
-            if (!nftData) {
-                await interaction.editReply({ content: "❌ No valid NFT found in this wallet! (Must be a single NFT, not a token)" });
-                return;
-            }
-            
-            avatarUrl = nftData.image;
-            walletAddress = wallet;
-            nftAttributes = nftData.attributes;
-            
-            // Resume normal flow (but use editReply instead of reply)
-            lobby.players.push({
-                id: interaction.user.id,
-                username: interaction.user.username,
-                avatarUrl: avatarUrl,
-                isOnline: true,
-                walletAddress,
-                nftAttributes
-            });
+
+            lobby.players.push(player);
 
             const playerList = lobby.players.map((p, i) => `**${i + 1}.** ${p.username}`).join('\n');
             const updateEmbed = new EmbedBuilder()
                 .setTitle(`⚔️ BATTLE ROYALE: ${lobby.settings.arena}`)
                 .setDescription(`**Host:** <@${lobby.hostId}>\n**Mode:** ${lobby.settings.registrationType}\n**Players:** ${lobby.players.length}/${lobby.maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
+                .addFields(
+                    { name: '📜 Rules', value: '• Online players beat offline players.\n• NFT Stats based on rarity traits.' },
+                    { name: '🎮 Commands', value: '• \`/battle join\` - Join Lobby\n• \`/wallet set\` - Link Wallet' }
+                )
                 .setColor(0xFFD700)
                 .setThumbnail(lobby.players[0].avatarUrl);
 
@@ -207,31 +274,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
                 const host = await interaction.client.users.fetch(lobby.hostId);
                 await interaction.followUp(`📢 **Lobby Full!** ${host.toString()}, type \`/battle start\` to begin!`);
             }
-            return;
-        }
-
-        // Default PFP or UPLOAD flow (non-wallet)
-        lobby.players.push({
-            id: interaction.user.id,
-            username: interaction.user.username,
-            avatarUrl: avatarUrl,
-            isOnline: true
-        });
-
-        // Update the lobby embed
-        const playerList = lobby.players.map((p, i) => `**${i + 1}.** ${p.username}`).join('\n');
-        const updateEmbed = new EmbedBuilder()
-            .setTitle(`⚔️ BATTLE ROYALE: ${lobby.settings.arena}`)
-            .setDescription(`**Host:** <@${lobby.hostId}>\n**Mode:** ${lobby.settings.registrationType}\n**Players:** ${lobby.players.length}/${lobby.maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
-            .setColor(0xFFD700)
-            .setThumbnail(lobby.players[0].avatarUrl); // Show host avatar as thumbnail
-
-        await interaction.reply({ embeds: [updateEmbed] });
-        
-        // Check if full
-        if (lobby.players.length === lobby.maxPlayers) {
-            const host = await interaction.client.users.fetch(lobby.hostId);
-            await interaction.followUp(`📢 **Lobby Full!** ${host.toString()}, type \`/battle start\` to begin!`);
+        } catch (error: any) {
+            await interaction.editReply({ content: `❌ Failed to join: ${error.message}` });
         }
         return;
     }
@@ -254,12 +298,196 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         }
 
         lobby.status = 'IN_PROGRESS';
+        
+        if (!(interaction.channel instanceof TextChannel)) {
+             await interaction.reply({ content: "❌ Battles can only be run in Text Channels.", ephemeral: true });
+             return;
+        }
+
+        const battleManager = new BattleManager(channelId, interaction.channel, {
+            arena: lobby.settings.arena,
+            genre: lobby.settings.genre,
+            style: "Comic Book"
+        });
+
+        for (const p of lobby.players) {
+            battleManager.addPlayer(p);
+        }
+
+        activeBattles.set(channelId, battleManager);
+        activeLobbies.delete(channelId);
+
         await interaction.reply({ content: `🔥 **THE BATTLE BEGINS!**\nArena: ${lobby.settings.arena}\nFighters: ${lobby.players.map(p => p.username).join(', ')}` });
 
-        // TODO: Trigger the Battle Engine here
-        // await startBattle(lobby);
-        
-        // Cleanup for now
-        activeLobbies.delete(channelId);
+        // Start the battle logic
+        await battleManager.startBattle();
     }
+}
+
+// Handle Select Menu and Modals
+export async function handleInteraction(interaction: StringSelectMenuInteraction | ModalSubmitInteraction) {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'battle_create_type') {
+        const type = interaction.values[0];
+        
+        const modal = new ModalBuilder()
+            .setCustomId(`battle_create_modal_${type}`)
+            .setTitle('Lobby Settings');
+
+        const playersInput = new TextInputBuilder()
+            .setCustomId('max_players')
+            .setLabel("Max Players (2-16)")
+            .setStyle(TextInputStyle.Short)
+            .setValue('2')
+            .setRequired(true);
+
+        const arenaInput = new TextInputBuilder()
+            .setCustomId('arena')
+            .setLabel("Arena Name")
+            .setStyle(TextInputStyle.Short)
+            .setValue('The Void')
+            .setRequired(true);
+
+        modal.addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(playersInput),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(arenaInput)
+        );
+
+        if (type === 'WALLET') {
+            // Check if user has wallet in DB to pre-fill? (Can't async pre-fill easily in this flow without delay)
+            // We'll just ask for it.
+            const walletInput = new TextInputBuilder()
+                .setCustomId('wallet_address')
+                .setLabel("Your Wallet Address")
+                .setStyle(TextInputStyle.Short)
+                .setPlaceholder("Solana Address")
+                .setRequired(true);
+            
+            modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(walletInput));
+        }
+
+        await interaction.showModal(modal);
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('battle_create_modal_')) {
+        const type = interaction.customId.replace('battle_create_modal_', '') as 'UPLOAD' | 'PFP' | 'WALLET';
+        const maxPlayers = parseInt(interaction.fields.getTextInputValue('max_players'));
+        const arena = interaction.fields.getTextInputValue('arena');
+        const channelId = interaction.channelId!;
+
+        if (isNaN(maxPlayers) || maxPlayers < 2 || maxPlayers > 16) {
+            await interaction.reply({ content: "❌ Players must be between 2 and 16.", ephemeral: true });
+            return;
+        }
+
+        if (activeLobbies.has(channelId)) {
+            await interaction.reply({ content: "❌ A lobby is already active in this channel!", ephemeral: true });
+            return;
+        }
+
+        await interaction.deferReply();
+
+        try {
+            let hostPlayer: Player | undefined;
+
+            // For UPLOAD, we cannot get the image from Modal. Host must join manually.
+            if (type === 'UPLOAD') {
+                // Do not register host yet
+            } else {
+                // For WALLET or PFP, try to register host
+                let wallet = undefined;
+                if (type === 'WALLET') {
+                    wallet = interaction.fields.getTextInputValue('wallet_address');
+                    // Also save to DB for future convenience?
+                    await updateUser(interaction.user.id, { wallet_address: wallet });
+                }
+
+                try {
+                    hostPlayer = await validateAndGetPlayerData(interaction.user, type, { wallet });
+                } catch (error) {
+                    if (error instanceof MultipleCollectionsError) {
+                        // Show Select Menu
+                        const select = new StringSelectMenuBuilder()
+                            .setCustomId('battle_create_collection_select')
+                            .setPlaceholder('Select a Collection')
+                            .addOptions(error.groups.map(g => ({ label: g, value: g })));
+                        
+                        const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+                        
+                        const response = await interaction.editReply({
+                            content: "⚠️ **Multiple Collections Found!**\nPlease select which collection you want to use for your fighter:",
+                            components: [row]
+                        });
+
+                        try {
+                            const confirmation = await response.awaitMessageComponent({ 
+                                filter: i => i.user.id === interaction.user.id, 
+                                time: 60000, 
+                                componentType: ComponentType.StringSelect 
+                            });
+                            
+                            const selectedGroup = (confirmation as StringSelectMenuInteraction).values[0];
+                            
+                            await confirmation.update({ content: `✅ Selected **${selectedGroup}**. Creating lobby...`, components: [] });
+                            
+                            hostPlayer = await validateAndGetPlayerData(interaction.user, type, { 
+                                wallet, 
+                                selectedCollectionGroup: selectedGroup 
+                            });
+                        } catch (e) {
+                            await interaction.editReply({ content: "❌ Selection timed out or failed. Lobby creation cancelled.", components: [] });
+                            return;
+                        }
+                    } else {
+                        throw error;
+                    }
+                }
+            }
+
+            const lobby: Lobby = {
+                hostId: interaction.user.id,
+                channelId: channelId,
+                players: hostPlayer ? [hostPlayer] : [],
+                maxPlayers: maxPlayers,
+                status: 'OPEN',
+                settings: {
+                    arena: arena,
+                    genre: 'Action',
+                    registrationType: type
+                }
+            };
+
+            activeLobbies.set(channelId, lobby);
+
+            const playerList = lobby.players.length > 0 ? `**1.** ${lobby.players[0].username}` : 'Waiting for host to join...';
+            const thumbnail = lobby.players.length > 0 ? lobby.players[0].avatarUrl : undefined;
+
+            const embed = new EmbedBuilder()
+                .setTitle(`⚔️ BATTLE ROYALE: ${arena}`)
+                .setDescription(`**Host:** ${interaction.user.username}\n**Mode:** ${type}\n**Players:** ${lobby.players.length}/${maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
+                .addFields(
+                    { name: '📜 Rules', value: '• Online players beat offline players.\n• NFT Stats based on rarity traits.' },
+                    { name: '🎮 Commands', value: '• \`/battle join\` - Join Lobby\n• \`/wallet set\` - Link Wallet' }
+                )
+                .setColor(0xFFD700);
+            
+            if (thumbnail) embed.setThumbnail(thumbnail);
+
+            await interaction.editReply({ embeds: [embed] });
+
+            if (type === 'UPLOAD') {
+                await interaction.followUp({ content: `✅ **Lobby Created!** Host, please use \`/battle join image:<attachment>\` to register your fighter!`, ephemeral: true });
+            }
+
+        } catch (error: any) {
+            await interaction.editReply({ content: `❌ Failed to create lobby: ${error.message}` });
+            activeLobbies.delete(channelId); // Cleanup
+        }
+    }
+
+    /* 
+    // Removed Select Menu Handler as we now auto-select random NFT
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('battle_select_nft_')) {
+        ...
+    } 
+    */
 }

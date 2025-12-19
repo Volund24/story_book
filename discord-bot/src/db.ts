@@ -30,13 +30,19 @@ class SQLiteAdapter implements DBAdapter {
                 id TEXT PRIMARY KEY,
                 tokens INTEGER DEFAULT 3,
                 last_generation INTEGER DEFAULT 0,
-                is_banned INTEGER DEFAULT 0
+                is_banned INTEGER DEFAULT 0,
+                wallet_address TEXT
             );
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
         `);
+
+        try {
+            await this.db.exec("ALTER TABLE users ADD COLUMN wallet_address TEXT");
+        } catch (e) {}
+
         await this.ensureCooldown();
     }
 
@@ -154,7 +160,7 @@ class PostgresAdapter implements DBAdapter {
 
 // --- Factory ---
 export async function initDB() {
-    if (process.env.DATABASE_URL) {
+    if (process.env.DATABASE_URL && process.env.DATABASE_URL.startsWith('postgres')) {
         console.log("Using PostgreSQL Database");
         adapter = new PostgresAdapter(process.env.DATABASE_URL);
     } else {

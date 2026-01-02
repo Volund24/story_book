@@ -54,6 +54,19 @@ interface Persona {
     desc: string;
 }
 
+export interface StoryConfig {
+    title: string;
+    heroName: string;
+    heroGender: string;
+    costarName?: string;
+    costarGender?: string;
+    costarRole?: string;
+    tone: string;
+    artStyle: string;
+    textBoxStyle: string;
+    customPremise?: string;
+}
+
 export class StoryGenerator {
     private ai: GoogleGenAI;
     private hero: Persona;
@@ -65,32 +78,48 @@ export class StoryGenerator {
     private channel: TextChannel;
     private interactionUser: any; // Discord User
     private webhook: WebhookClient | null = null;
+    private config: StoryConfig;
 
-    constructor(apiKey: string, heroUrl: string, friendUrl: string | null, genre: string, channel: TextChannel, user: any, webhookUrl?: string) {
+    constructor(
+        apiKey: string, 
+        heroUrl: string, 
+        friendUrl: string | null, 
+        genre: string, 
+        channel: TextChannel, 
+        user: any, 
+        webhookUrl?: string,
+        config?: StoryConfig
+    ) {
         this.ai = new GoogleGenAI({ apiKey });
-        this.hero = { base64: '', desc: 'The Main Hero' }; // Will load async
-        this.friend = friendUrl ? { base64: '', desc: 'The Sidekick/Rival' } : null;
         this.genre = genre;
         this.channel = channel;
         this.interactionUser = user;
         
-        // Pick a random tone based on genre
-        let availableTones = TONES;
-        if (genre === "Teen Drama / Slice of Life" || genre === "Lighthearted Comedy") {
-            availableTones = TONES.filter(t => t.includes("CASUAL") || t.includes("WHOLESOME") || t.includes("QUIPPY"));
-        } else if (genre === "Classic Horror") {
-            availableTones = TONES.filter(t => t.includes("INNER-MONOLOGUE") || t.includes("OPERATIC"));
-        }
-        this.tone = availableTones[Math.floor(Math.random() * availableTones.length)];
+        // Default config if not provided (backward compatibility)
+        this.config = config || {
+            title: "Infinite Heroes",
+            heroName: "The Hero",
+            heroGender: "Male",
+            tone: "Action-Heavy",
+            artStyle: "Modern Comic Book",
+            textBoxStyle: "Classic White"
+        };
+
+        this.tone = this.config.tone;
+
+        this.hero = { 
+            base64: heroUrl, 
+            desc: `${this.config.heroName} (${this.config.heroGender})` 
+        };
+        
+        this.friend = friendUrl ? { 
+            base64: friendUrl, 
+            desc: `${this.config.costarName || 'The Partner'} (${this.config.costarGender || 'Male'}) - Role: ${this.config.costarRole || 'Sidekick'}` 
+        } : null;
 
         if (webhookUrl) {
             this.webhook = new WebhookClient({ url: webhookUrl });
         }
-
-        // We need to load images before starting, but constructor is sync. 
-        // We'll call a prepare() method.
-        this.hero.base64 = heroUrl; // Temporarily store URL
-        if (this.friend) this.friend.base64 = friendUrl!;
     }
 
     private async urlToBase64(url: string): Promise<string> {
@@ -211,6 +240,41 @@ export class StoryGenerator {
         }
     }
 
+    private async generateCover() {
+        const prompt = `
+        Create a comic book cover for a story titled "${this.config.title}".
+        Genre: ${this.genre}
+        Art Style: ${this.config.artStyle}
+        
+        Characters:
+        1. ${this.config.heroName} (${this.config.heroGender}) - The Main Protagonist.
+        ${this.friend ? `2. ${this.config.costarName} (${this.config.costarGender}) - The ${this.config.costarRole}.` : ''}
+
+        Premise: ${this.config.customPremise || `A classic ${this.genre} story.`}
+
+        Visuals: Dynamic, high-contrast, professional comic book cover art. Title text should be integrated into the art.
+        `;
+
+        const beat: Beat = {
+            scene: prompt,
+            choices: [],
+            focus_char: 'hero'
+        };
+
+        const imageUrl = await this.generateImage(beat, 'cover');
+        
+        const face: ComicFace = {
+            id: 'cover',
+            type: 'cover',
+            imageUrl: imageUrl,
+            pageIndex: 0,
+            choices: []
+        };
+        this.history.push(face);
+        
+        if (imageUrl) await this.postPanelToDiscord(face);
+    }
+
     private async generateBeat(pageNum: number, isDecisionPage: boolean): Promise<Beat> {
         const isFinalPage = pageNum === MAX_STORY_PAGES;
         const langName = "English"; // Hardcoded for now
@@ -226,12 +290,19 @@ export class StoryGenerator {
 
         let friendInstruction = "Not yet introduced.";
         if (this.friend) {
-            friendInstruction = "ACTIVE and PRESENT (User Provided). Ensure they are woven into the scene.";
+            friendInstruction = `ACTIVE and PRESENT. Name: ${this.config.costarName}. Role: ${this.config.costarRole}. Ensure they are woven into the scene.`;
         }
 
-        let coreDriver = `GENRE: ${this.genre}. TONE: ${this.tone}.`;
+        let coreDriver = `GENRE: ${this.genre}. TONE: ${this.tone}. ART STYLE: ${this.config.artStyle}.`;
         
         let instruction = `Continue the story. ALL OUTPUT TEXT MUST BE IN ${langName.toUpperCase()}. ${coreDriver}`;
+        
+        // Romance Gate
+        if (this.genre !== 'Romance') {
+            instruction += " STRICTLY NO ROMANCE OR SLICE OF LIFE ELEMENTS. FOCUS ON ACTION AND PLOT.";
+        } else {
+            instruction += " FOCUS ON EMOTIONAL CONNECTION AND RELATIONSHIPS.";
+        }
         
         if (isFinalPage) {
             instruction += " FINAL PAGE. KARMIC CLIFFHANGER REQUIRED. Text must end with 'TO BE CONTINUED...'.";
@@ -250,7 +321,7 @@ TARGET LANGUAGE: ${langName}.
 ${coreDriver}
 
 CHARACTERS:
-- HERO: Active.
+- HERO: ${this.config.heroName} (${this.config.heroGender}). Active.
 - CO-STAR: ${friendInstruction}
 
 PREVIOUS PANELS:
@@ -305,17 +376,17 @@ OUTPUT STRICT JSON ONLY:
             contents.push({ inlineData: { mimeType: 'image/jpeg', data: this.friend.base64 } });
         }
 
-        let promptText = `STYLE: ${this.genre} comic book art, detailed ink, vibrant colors. `;
+        let promptText = `STYLE: ${this.config.artStyle}, ${this.genre} comic book art, detailed ink, vibrant colors. `;
         
         if (type === 'cover') {
-            promptText += `TYPE: Comic Book Cover. TITLE: "INFINITE HEROES". Main visual: Dynamic action shot of [HERO].`;
+            promptText += `TYPE: Comic Book Cover. TITLE: "${this.config.title}". Main visual: Dynamic action shot of [HERO].`;
         } else if (type === 'back_cover') {
             promptText += `TYPE: Comic Back Cover. FULL PAGE VERTICAL ART. Text: "NEXT ISSUE SOON".`;
         } else {
             promptText += `TYPE: Vertical comic panel. SCENE: ${beat.scene}. `;
             promptText += `INSTRUCTIONS: Maintain strict character likeness. If scene mentions 'HERO', use REFERENCE 1. If 'CO-STAR', use REFERENCE 2.`;
-            if (beat.caption) promptText += ` INCLUDE CAPTION BOX: "${beat.caption}"`;
-            if (beat.dialogue) promptText += ` INCLUDE SPEECH BUBBLE: "${beat.dialogue}"`;
+            if (beat.caption) promptText += ` INCLUDE CAPTION BOX (${this.config.textBoxStyle}): "${beat.caption}"`;
+            if (beat.dialogue) promptText += ` INCLUDE SPEECH BUBBLE (${this.config.textBoxStyle}): "${beat.dialogue}"`;
         }
 
         contents.push({ text: promptText });

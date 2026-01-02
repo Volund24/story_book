@@ -154,9 +154,10 @@ class PostgresAdapter implements DBAdapter {
 
 // --- Factory ---
 export async function initDB() {
-    if (process.env.DATABASE_URL) {
+    const dbUrl = process.env.DATABASE_URL;
+    if (dbUrl && dbUrl.startsWith('postgres')) {
         console.log("Using PostgreSQL Database");
-        adapter = new PostgresAdapter(process.env.DATABASE_URL);
+        adapter = new PostgresAdapter(dbUrl);
     } else {
         console.log("Using SQLite Database");
         adapter = new SQLiteAdapter();

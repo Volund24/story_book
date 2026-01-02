@@ -34,10 +34,8 @@ const KNOWN_COLLECTIONS: Record<string, string> = {
  */
 export async function getAvailableCollections(): Promise<Map<string, string>> {
     const serverCollection = await getConfig('server_collection');
-    const serverCollectionSlug = await getConfig('server_collection_slug');
-    
     const partnerCollectionsStr = await getConfig('partner_collections');
-    const partnerCollectionsSlugsStr = await getConfig('partner_collections_slugs');
+    const collectionMapStr = await getConfig('collection_map');
     const enablePartners = await getConfig('enable_partners') === 'true';
 
     const groups = new Set<string>();
@@ -49,10 +47,14 @@ export async function getAvailableCollections(): Promise<Map<string, string>> {
     }
     
     const map = new Map<string, string>();
-    
-    // Helper to map addresses to slugs if possible
-    const partnerSlugs = partnerCollectionsSlugsStr ? partnerCollectionsSlugsStr.split(',').map(s => s.trim()) : [];
-    const partnerAddrs = partnerCollectionsStr ? partnerCollectionsStr.split(',').map(s => s.trim()) : [];
+    let savedMap: Record<string, string> = {};
+    try {
+        if (collectionMapStr) {
+            savedMap = JSON.parse(collectionMapStr);
+        }
+    } catch (e) {
+        console.error("Failed to parse collection_map config", e);
+    }
 
     for (const g of groups) {
         // 1. Check Hardcoded List
@@ -61,34 +63,19 @@ export async function getAvailableCollections(): Promise<Map<string, string>> {
             continue;
         }
 
-        // 2. Check Server Slug
-        if (serverCollection && serverCollection.includes(g) && serverCollectionSlug) {
-            map.set(g, serverCollectionSlug); // Map address to the configured slug
+        // 2. Check Saved Map (from Admin Config)
+        if (savedMap[g]) {
+            map.set(g, savedMap[g]);
             continue;
         }
 
-        // 3. Check Partner Slugs (Best Effort)
-        if (enablePartners && partnerAddrs.includes(g)) {
-            const index = partnerAddrs.indexOf(g);
-            if (index !== -1 && index < partnerSlugs.length) {
-                map.set(g, partnerSlugs[index]);
-                continue;
-            }
-            // If we have slugs but index mismatch (e.g. 1 slug -> multiple addresses), try to use the first slug?
-            // This is risky but better than an address.
-            if (partnerSlugs.length === 1) {
-                map.set(g, partnerSlugs[0]);
-                continue;
-            }
-        }
-
-        // 4. Check Cache
+        // 3. Check Cache
         if (collectionNameCache.has(g)) {
             map.set(g, collectionNameCache.get(g)!);
             continue;
         }
 
-        // 5. If it looks like an address, try to fetch its name (Fallback)
+        // 4. If it looks like an address, try to fetch its name (Fallback)
         if (g.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
             try {
                 console.log(`Fetching metadata for collection: ${g}`);

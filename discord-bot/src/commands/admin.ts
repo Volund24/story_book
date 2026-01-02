@@ -170,18 +170,24 @@ export async function handleModal(interaction: ModalSubmitInteraction) {
 
     // Resolve Partners
     const partnerAddresses: string[] = [];
-    const partnerSlugs: string[] = [];
+    const collectionMap: Record<string, string> = {}; // Address -> Name/Slug
     
     if (partnerCollectionsInput) {
         const inputs = partnerCollectionsInput.split(',').map(s => s.trim()).filter(s => s.length > 0);
         for (const input of inputs) {
             if (input.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
                 partnerAddresses.push(input);
+                // If it's an address, we don't know the name yet, but we can try to fetch it later or leave it blank
+                // For now, let's just use the address as the name if we can't resolve it, 
+                // but the verifier will try to fetch metadata.
             } else {
                 const resolved = await resolveCollectionFromSlug(input);
                 if (resolved.length > 0) {
                     partnerAddresses.push(...resolved);
-                    partnerSlugs.push(input);
+                    // Map all resolved addresses to this slug
+                    resolved.forEach(addr => {
+                        collectionMap[addr] = input;
+                    });
                 } else {
                     await interaction.editReply({ content: `❌ Could not resolve HowRare slug: ${input}` });
                     return;
@@ -190,11 +196,18 @@ export async function handleModal(interaction: ModalSubmitInteraction) {
         }
     }
 
+    // Also map server collection if it was a slug
+    if (serverCollectionAddress && serverCollectionInput && !serverCollectionInput.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+         serverCollectionAddress.split(',').forEach(addr => {
+             collectionMap[addr] = serverCollectionInput;
+         });
+    }
+
     await setConfig('cooldown_ms', (hours * 60 * 60 * 1000).toString());
     await setConfig('server_collection', serverCollectionAddress || '');
     await setConfig('partner_collections', partnerAddresses.join(','));
-    await setConfig('partner_collections_slugs', partnerSlugs.join(','));
+    await setConfig('collection_map', JSON.stringify(collectionMap));
     await setConfig('enable_partners', enablePartners.toLowerCase() === 'true' ? 'true' : 'false');
 
-    await interaction.editReply({ content: "✅ Configuration saved successfully! Slugs resolved to addresses." });
+    await interaction.editReply({ content: "✅ Configuration saved successfully! Slugs resolved and mapped." });
 }

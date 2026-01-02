@@ -37,6 +37,8 @@ interface Lobby {
         genre: string;
         registrationType: 'UPLOAD' | 'PFP' | 'WALLET';
     };
+    autoStartTimer?: NodeJS.Timeout;
+    countdownInterval?: NodeJS.Timeout;
 }
 
 interface Player {
@@ -268,10 +270,18 @@ export async function execute(interaction: ChatInputCommandInteraction) {
             } catch (error) {
                 if (error instanceof MultipleCollectionsError) {
                     // Show Select Menu for Collections
+                    // Note: error.groups contains the IDs/Labels from the error, but we want friendly names if possible.
+                    // However, MultipleCollectionsError is thrown deep inside.
+                    // Let's re-fetch available collections to get friendly names matching the error groups.
+                    const availableCollections = await getAvailableCollections();
+                    
                     const select = new StringSelectMenuBuilder()
                         .setCustomId('battle_join_collection_select')
                         .setPlaceholder('Select a Collection')
-                        .addOptions(error.groups.map(g => ({ label: g, value: g })));
+                        .addOptions(error.groups.map(g => {
+                            const name = availableCollections.get(g) || g;
+                            return { label: name.substring(0, 100), value: g };
+                        }));
                     
                     const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
                     
@@ -284,7 +294,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
                         const confirmation = await response.awaitMessageComponent({ filter: i => i.user.id === interaction.user.id, time: 60000, componentType: ComponentType.StringSelect });
                         
                         const selectedGroup = (confirmation as StringSelectMenuInteraction).values[0];
-                        await confirmation.update({ content: `✅ Selected **${selectedGroup}**. Entering arena...`, components: [] });
+                        const friendlyName = availableCollections.get(selectedGroup) || selectedGroup;
+                        
+                        await confirmation.update({ content: `✅ Selected **${friendlyName}**. Entering arena...`, components: [] });
                         
                         player = await validateAndGetPlayerData(interaction.user, lobby.settings.registrationType, {
                             image: interaction.options.getAttachment('image') || undefined,
@@ -311,13 +323,57 @@ export async function execute(interaction: ChatInputCommandInteraction) {
                     { name: '🎮 Commands', value: '• \`/battle join\` - Join Lobby\n• \`/wallet set\` - Link Wallet' }
                 )
                 .setColor(0xFFD700)
-                .setThumbnail(lobby.players[0].avatarUrl);
+                .setThumbnail(player.avatarUrl);
 
             await interaction.editReply({ embeds: [updateEmbed] });
             
             if (lobby.players.length === lobby.maxPlayers) {
                 const host = await interaction.client.users.fetch(lobby.hostId);
-                await interaction.followUp(`📢 **Lobby Full!** ${host.toString()}, type \`/battle start\` to begin!`);
+                await interaction.followUp(`📢 **Lobby Full!** Starting in 5 minutes...`);
+                
+                // Start Countdown
+                let timeLeft = 300; // 5 minutes in seconds
+                
+                // Clear any existing timer
+                if (lobby.autoStartTimer) clearTimeout(lobby.autoStartTimer);
+                if (lobby.countdownInterval) clearInterval(lobby.countdownInterval);
+
+                lobby.countdownInterval = setInterval(async () => {
+                    timeLeft -= 60;
+                    if (timeLeft > 0) {
+                        if (interaction.channel && 'send' in interaction.channel) {
+                            await (interaction.channel as TextChannel).send(`⏳ **Battle starting in ${timeLeft / 60} minutes...**`);
+                        }
+                        
+                        // Pings
+                        if (timeLeft === 300 || timeLeft === 180) { // 5m (already sent above), 3m
+                             if (interaction.channel && 'send' in interaction.channel) {
+                                await (interaction.channel as TextChannel).send(`@everyone 📢 **Battle starting in ${timeLeft / 60} minutes!** Join now if spots open! (Wait, it's full)`);
+                             }
+                        }
+                    } else {
+                        if (lobby.countdownInterval) clearInterval(lobby.countdownInterval);
+                    }
+                }, 60000);
+
+                // Final 30s ping
+                setTimeout(async () => {
+                     if (activeLobbies.has(channelId)) {
+                        if (interaction.channel && 'send' in interaction.channel) {
+                            await (interaction.channel as TextChannel).send(`@everyone ⚠️ **Battle starting in 30 seconds!**`);
+                        }
+                     }
+                }, 270000); // 4m 30s
+
+                // Auto Start
+                lobby.autoStartTimer = setTimeout(async () => {
+                    if (activeLobbies.has(channelId)) {
+                        const currentLobby = activeLobbies.get(channelId);
+                        if (currentLobby && currentLobby.status === 'OPEN') {
+                            await startBattleLogic(interaction.channel as TextChannel, currentLobby);
+                        }
+                    }
+                }, 300000); // 5 minutes
             }
         } catch (error: any) {
             await interaction.editReply({ content: `❌ Failed to join: ${error.message}` });
@@ -344,36 +400,37 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
         // Enforce Even Brackets (Powers of 2: 2, 4, 8, 16)
         const validCounts = [2, 4, 8, 16];
-        if (!validCounts.includes(lobby.players.length)) {
+        // Gang Mode Exception
+        const isGangMode = lobby.settings.genre === 'GANG_MODE'; 
+        
+        if (!isGangMode && !validCounts.includes(lobby.players.length)) {
              await interaction.reply({ content: `❌ **Even Brackets Enforced!**\nCurrent player count: ${lobby.players.length}.\nRequired: 2, 4, 8, or 16 players.\n\nPlease wait for more players or kick someone to match the bracket.`, ephemeral: true });
              return;
         }
 
-        lobby.status = 'IN_PROGRESS';
-        
-        if (!(interaction.channel instanceof TextChannel)) {
-             await interaction.reply({ content: "❌ Battles can only be run in Text Channels.", ephemeral: true });
-             return;
-        }
+        // Cancel auto-start if manually started
+        if (lobby.autoStartTimer) clearTimeout(lobby.autoStartTimer);
+        if (lobby.countdownInterval) clearInterval(lobby.countdownInterval);
 
-        const battleManager = new BattleManager(channelId, interaction.channel, {
-            arena: lobby.settings.arena,
-            genre: lobby.settings.genre,
-            style: "Comic Book"
-        });
-
-        for (const p of lobby.players) {
-            battleManager.addPlayer(p);
-        }
-
-        activeBattles.set(channelId, battleManager);
-        activeLobbies.delete(channelId);
-
-        await interaction.reply({ content: `🔥 **THE BATTLE BEGINS!**\nArena: ${lobby.settings.arena}\nFighters: ${lobby.players.map(p => p.username).join(', ')}` });
-
-        // Start the battle logic
-        await battleManager.startBattle();
+        await startBattleLogic(interaction.channel as TextChannel, lobby);
+        await interaction.reply({ content: "🚀 Battle Started Manually!", ephemeral: true });
     }
+}
+
+async function startBattleLogic(channel: TextChannel, lobby: Lobby) {
+    lobby.status = 'IN_PROGRESS';
+    
+    const battle = new BattleManager(channel.id, channel, {
+        arena: lobby.settings.arena,
+        genre: lobby.settings.genre,
+        style: "Comic Book" // Default style
+    });
+
+    lobby.players.forEach(p => battle.addPlayer(p));
+    activeBattles.set(channel.id, battle);
+    activeLobbies.delete(channel.id); // Remove lobby once battle starts
+
+    await battle.startBattle();
 }
 
 // Handle Select Menu and Modals
@@ -527,14 +584,16 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
 
                     // Check for multiple collections BEFORE verifying wallet
                     const availableCollections = await getAvailableCollections();
-                    const groups = Array.from(availableCollections.keys());
-
-                    if (groups.length > 1) {
+                    
+                    if (availableCollections.size > 1) {
                         // Ask user to select collection
                         const select = new StringSelectMenuBuilder()
                             .setCustomId('battle_create_collection_select_temp')
                             .setPlaceholder('Select a Collection')
-                            .addOptions(groups.map(g => ({ label: g, value: g })));
+                            .addOptions(Array.from(availableCollections.entries()).map(([id, name]) => ({ 
+                                label: name.substring(0, 100), 
+                                value: id 
+                            })));
                         
                         const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
                         
@@ -552,13 +611,16 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
                             
                             selectedCollectionGroup = (confirmation as StringSelectMenuInteraction).values[0];
                             
-                            await confirmation.update({ content: `✅ Selected **${selectedCollectionGroup}**. Verifying wallet...`, components: [] });
+                            // Get the label for the selected group to show a friendly name
+                            const friendlyName = availableCollections.get(selectedCollectionGroup) || selectedCollectionGroup;
+
+                            await confirmation.update({ content: `✅ Selected **${friendlyName}**. Verifying wallet...`, components: [] });
                         } catch (e) {
                             await interaction.editReply({ content: "❌ Selection timed out. Lobby creation cancelled.", components: [] });
                             return;
                         }
-                    } else if (groups.length === 1) {
-                        selectedCollectionGroup = groups[0];
+                    } else if (availableCollections.size === 1) {
+                        selectedCollectionGroup = availableCollections.keys().next().value;
                     }
                 }
 
@@ -567,10 +629,15 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
                 } catch (error) {
                     if (error instanceof MultipleCollectionsError) {
                         // This fallback should rarely be hit now, but kept for safety
+                        const availableCollections = await getAvailableCollections();
+                        
                         const select = new StringSelectMenuBuilder()
                             .setCustomId('battle_create_collection_select')
                             .setPlaceholder('Select a Collection')
-                            .addOptions(error.groups.map(g => ({ label: g, value: g })));
+                            .addOptions(error.groups.map(g => {
+                                const name = availableCollections.get(g) || g;
+                                return { label: name.substring(0, 100), value: g };
+                            }));
                         
                         const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
                         
@@ -587,8 +654,9 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
                             });
                             
                             const selectedGroup = (confirmation as StringSelectMenuInteraction).values[0];
+                            const friendlyName = availableCollections.get(selectedGroup) || selectedGroup;
                             
-                            await confirmation.update({ content: `✅ Selected **${selectedGroup}**. Creating lobby...`, components: [] });
+                            await confirmation.update({ content: `✅ Selected **${friendlyName}**. Creating lobby...`, components: [] });
                             
                             hostPlayer = await validateAndGetPlayerData(interaction.user, type, { 
                                 wallet, 

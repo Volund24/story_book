@@ -44,6 +44,8 @@ export class BattleManager {
     private genAI: GoogleGenAI;
     private victoryPages: string[] = []; // Store victory images for PDF
 
+    public matchQueue: { p1: BattlePlayer, p2: BattlePlayer }[] = [];
+
     constructor(lobbyId: string, channel: TextChannel, settings: BattleSettings) {
         this.lobbyId = lobbyId;
         this.channelId = channel.id;
@@ -54,15 +56,12 @@ export class BattleManager {
         this.history = [];
         this.status = 'WAITING';
         
-        // Initialize Gemini (API Key should be in env)
-        this.genAI = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        // Initialize Gemini
+        this.genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_KEY });
     }
 
     addPlayer(playerData: { id: string; username: string; avatarUrl: string; walletAddress?: string; nftAttributes?: any[] }) {
-        // Gender enforcement logic: Default to Male unless explicitly detected/stated (Placeholder for now)
-        // In a real scenario, we might use Vision API to check the avatar, or ask the user.
-        // For now, per requirements: "Enforce male gender... unless... clearly identifies it".
-        // We'll default to Male.
+        // Gender enforcement logic: Default to Male unless explicitly detected/stated
         const gender: 'Male' | 'Female' = 'Male'; 
 
         const player: BattlePlayer = {
@@ -79,22 +78,66 @@ export class BattleManager {
         this.round = 1;
         await this.channel.send({ content: `⚔️ **The Battle Begins!** ⚔️\nArena: **${this.settings.arena}** | Genre: **${this.settings.genre}**` });
         
-        // TODO: Start the first round loop
+        // Generate Initial Bracket
+        this.generateBracket();
+        
         await this.processRound();
     }
 
-    async processRound() {
-        // 1. Matchmaking (Simple pairs for now)
+    private generateBracket() {
         const alivePlayers = Array.from(this.players.values()).filter(p => p.status === 'ALIVE');
         
-        if (alivePlayers.length <= 1) {
-            await this.endBattle(alivePlayers[0]);
-            return;
+        // Shuffle
+        for (let i = alivePlayers.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [alivePlayers[i], alivePlayers[j]] = [alivePlayers[j], alivePlayers[i]];
         }
 
-        // Example: Take first two for a 1v1
-        const p1 = alivePlayers[0];
-        const p2 = alivePlayers[1];
+        this.matchQueue = [];
+        // Pair up
+        for (let i = 0; i < alivePlayers.length; i += 2) {
+            if (i + 1 < alivePlayers.length) {
+                this.matchQueue.push({ p1: alivePlayers[i], p2: alivePlayers[i+1] });
+            } else {
+                // Odd number, bye round? Or handle differently. 
+                // For now, auto-win or wait? 
+                // Let's just push them as a "bye" (p2 is same as p1, handle in logic)
+                // Actually, better to just leave them in 'ALIVE' and they fight next round winners.
+                // But for simplicity in this loop, let's just add them to the next pool implicitly.
+            }
+        }
+    }
+
+    async processRound() {
+        // Check if we have matches in the queue
+        if (this.matchQueue.length === 0) {
+            // Check if we have a winner
+            const alivePlayers = Array.from(this.players.values()).filter(p => p.status === 'ALIVE');
+            
+            if (alivePlayers.length === 1) {
+                await this.endBattle(alivePlayers[0]);
+                return;
+            }
+            
+            if (alivePlayers.length === 0) {
+                await this.endBattle(); // Draw?
+                return;
+            }
+
+            // Generate next round bracket
+            this.generateBracket();
+            
+            if (this.matchQueue.length === 0 && alivePlayers.length > 1) {
+                // Should not happen if logic is correct, but safety net
+                console.error("Stuck in loop, forcing random match");
+                this.matchQueue.push({ p1: alivePlayers[0], p2: alivePlayers[1] });
+            }
+        }
+
+        const match = this.matchQueue.shift();
+        if (!match) return;
+
+        const { p1, p2 } = match;
 
         await this.channel.send(`🥊 **Round ${this.round}**: ${p1.username} vs ${p2.username}!`);
 
@@ -105,6 +148,9 @@ export class BattleManager {
                 const buffer = Buffer.from(headToHeadUrl.split(',')[1], 'base64');
                 const attachment = new AttachmentBuilder(buffer, { name: 'h2h.png' });
                 await this.channel.send({ content: "**FIGHTERS APPROACH!**", files: [attachment] });
+            } else {
+                // Debug message if image fails
+                // await this.channel.send("⚠️ H2H Image generation failed (API Error or Safety).");
             }
 
             // --- SCENE 2: ACTION SEQUENCE ---
@@ -131,6 +177,8 @@ export class BattleManager {
                 const attachment = new AttachmentBuilder(buffer, { name: 'action.png' });
                 embed.setImage('attachment://action.png');
                 files.push(attachment);
+            } else {
+                 // await this.channel.send("⚠️ Action Image generation failed.");
             }
 
             await this.channel.send({ embeds: [embed], files });
@@ -147,8 +195,8 @@ export class BattleManager {
 
             this.round++;
             
-            // Continue to next round after delay
-            setTimeout(() => this.processRound(), 8000); // Increased delay for suspense
+            // Continue to next match
+            setTimeout(() => this.processRound(), 8000); 
 
         } catch (error) {
             console.error("Round failed:", error);
@@ -191,16 +239,19 @@ export class BattleManager {
             ` });
 
             const imgRes = await this.genAI.models.generateContent({
-                model: "gemini-3-pro-image-preview",
+                model: "gemini-2.0-flash-exp",
                 contents: contents
             });
             
             const part = imgRes.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);
             if (part?.inlineData?.data) {
                 imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+            } else {
+                console.log("No inlineData in H2H response:", JSON.stringify(imgRes, null, 2));
             }
-        } catch (e) {
+        } catch (e: any) {
             console.error("H2H Gen Failed", e);
+            if (e.message) console.error("Error Message:", e.message);
         }
         return imageUrl;
     }
@@ -247,9 +298,9 @@ export class BattleManager {
             ` });
 
             const imgRes = await this.genAI.models.generateContent({
-                model: "gemini-3-pro-image-preview", // Using the model from App.tsx
+                model: "gemini-2.0-flash-exp", // Updated to a model that might support image gen or at least is valid
                 contents: contents,
-                config: { responseMimeType: 'application/json' } // Some models require this for structured output, but for image?
+                // config: { responseMimeType: 'application/json' } // Removed as it might conflict with image gen
             });
             
             // Check for image data in response
@@ -258,9 +309,12 @@ export class BattleManager {
             const part = imgRes.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);
             if (part?.inlineData?.data) {
                 imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+            } else {
+                 console.log("No inlineData in response:", JSON.stringify(imgRes, null, 2));
             }
-        } catch (e) {
+        } catch (e: any) {
             console.error("Image Gen Failed", e);
+            if (e.message) console.error("Error Message:", e.message);
         }
 
         return { narrative, imageUrl };

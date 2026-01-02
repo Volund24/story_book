@@ -18,6 +18,15 @@ export interface NFTData {
     collectionGroup?: string;
 }
 
+// Cache for collection names to avoid repeated RPC calls
+const collectionNameCache = new Map<string, string>();
+
+// Hardcoded Collection Names (Address -> Name)
+const KNOWN_COLLECTIONS: Record<string, string> = {
+    "6BJuVsENAMUEvR9ftviSVb5JokS12pF3FF2EnExdc2UD": "Gainz",
+    // Add more here if needed
+};
+
 /**
  * Helper to get the list of configured collections (Label -> IDs)
  */
@@ -26,30 +35,6 @@ export async function getAvailableCollections(): Promise<Map<string, string>> {
     const partnerCollectionsStr = await getConfig('partner_collections');
     const enablePartners = await getConfig('enable_partners') === 'true';
 
-    // Map of Collection ID -> Config Label (e.g. "gainz")
-    const validCollections = new Map<string, string>();
-    
-    const processConfigItem = async (item: string, label: string) => {
-        const s = item.trim();
-        if (s.length === 0) return;
-        
-        // Check if it looks like a Solana Public Key
-        if (s.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
-            validCollections.set(s, label);
-        } else {
-            // Assume it's a slug and try to resolve it
-            // Note: Resolving slugs every time might be slow. Ideally cache this.
-            // For now, we just return the slug as the label if we can't resolve it here, 
-            // but verifyWalletAndGetNFTs does the resolution.
-            // Actually, for the dropdown, we just need the LABELS.
-            // The IDs are needed for verification.
-            // Let's just return the labels for now.
-        }
-    };
-
-    // This function is tricky because verifyWalletAndGetNFTs does the resolution.
-    // We just want the LIST of groups (labels) to show to the user.
-    
     const groups = new Set<string>();
     if (serverCollection) {
         serverCollection.split(',').forEach(s => { if(s.trim()) groups.add(s.trim()); });
@@ -58,11 +43,43 @@ export async function getAvailableCollections(): Promise<Map<string, string>> {
         partnerCollectionsStr.split(',').forEach(s => { if(s.trim()) groups.add(s.trim()); });
     }
     
-    // We return a map of Label -> Label (since we don't have IDs resolved yet without async calls)
-    // But wait, verifyWalletAndGetNFTs resolves them.
-    // If we want to show a dropdown, we just need the names.
     const map = new Map<string, string>();
-    groups.forEach(g => map.set(g, g));
+    
+    for (const g of groups) {
+        // 1. Check Hardcoded List
+        if (KNOWN_COLLECTIONS[g]) {
+            map.set(g, KNOWN_COLLECTIONS[g]);
+            continue;
+        }
+
+        // 2. Check Cache
+        if (collectionNameCache.has(g)) {
+            map.set(g, collectionNameCache.get(g)!);
+            continue;
+        }
+
+        // 3. If it looks like an address, try to fetch its name (Fallback)
+        if (g.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+            try {
+                console.log(`Fetching metadata for collection: ${g}`);
+                const asset = await fetchDigitalAsset(umi, publicKey(g));
+                const name = asset.metadata.name;
+                console.log(`Resolved collection ${g} to name: ${name}`);
+                map.set(g, name);
+                collectionNameCache.set(g, name);
+            } catch (e) {
+                console.error(`Failed to fetch name for collection ${g}:`, e);
+                const fallback = `${g.substring(0, 4)}...${g.substring(g.length - 4)}`;
+                map.set(g, fallback);
+                collectionNameCache.set(g, fallback);
+            }
+        } else {
+            // It's likely a slug or name already
+            map.set(g, g);
+            collectionNameCache.set(g, g);
+        }
+    }
+    
     return map;
 }
 

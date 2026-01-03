@@ -31,8 +31,11 @@ cd $BOT_DIR
 
 # 2. Create .env file
 echo "🔐 Configuring environment..."
-# Note: GEMINI_KEY is set to a placeholder. You must update it manually if not provided!
-cat > .env <<ENVEOF
+if [ -f .env ]; then
+    echo "✅ .env file already exists. Skipping creation."
+else
+    echo "⚠️ .env file not found. Creating placeholder (PLEASE UPDATE MANUALLY)..."
+    cat > .env <<ENVEOF
 DISCORD_TOKEN=YOUR_DISCORD_TOKEN
 CLIENT_ID=YOUR_CLIENT_ID
 WEB_APP_URL=https://story-book-etoqgyahl-volund24s-projects.vercel.app
@@ -40,6 +43,7 @@ DATABASE_URL=postgresql://postgres:svX%24Z%40xkn9zy%24sF@db.fhkfsdirfdritfguevfh
 NODE_OPTIONS='--dns-result-order=ipv4first'
 GEMINI_KEY=PLACEHOLDER_PLEASE_UPDATE
 ENVEOF
+fi
 
 # 3. Docker Operations
 echo "🐳 Building Docker image..."

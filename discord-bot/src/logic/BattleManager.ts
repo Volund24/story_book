@@ -43,8 +43,13 @@ export class BattleManager {
     private channel: TextChannel;
     private genAI: GoogleGenAI;
     private victoryPages: string[] = []; // Store victory images for PDF
+    private frontCoverUrl: string = ""; // Store front cover image
 
     public matchQueue: { p1: BattlePlayer, p2: BattlePlayer }[] = [];
+    
+    // New properties for multi-round matches
+    private currentMatchRounds: number = 0;
+    private targetMatchRounds: number = 2;
 
     constructor(lobbyId: string, channel: TextChannel, settings: BattleSettings) {
         this.lobbyId = lobbyId;
@@ -78,10 +83,63 @@ export class BattleManager {
         this.round = 1;
         await this.channel.send({ content: `⚔️ **The Battle Begins!** ⚔️\nArena: **${this.settings.arena}** | Genre: **${this.settings.genre}**` });
         
+        // Generate Front Cover
+        await this.generateFrontCover();
+
         // Generate Initial Bracket
         this.generateBracket();
         
         await this.processRound();
+    }
+
+    async generateFrontCover() {
+        await this.channel.send("🎨 **Generating Tournament Cover Art...**");
+        try {
+            const players = Array.from(this.players.values());
+            const contents: any[] = [];
+            
+            // Add player references (limit to first 6 to avoid overloading context window/visual clutter)
+            const featuredPlayers = players.slice(0, 6);
+            
+            for (let i = 0; i < featuredPlayers.length; i++) {
+                const p = featuredPlayers[i];
+                const imgBase64 = await this.fetchImageAsBase64(p.avatarUrl);
+                if (imgBase64) {
+                    contents.push({ text: `REFERENCE ${i + 1} [${p.username}]:` });
+                    contents.push({ inlineData: { mimeType: 'image/png', data: imgBase64 } });
+                }
+            }
+
+            const prompt = `
+                STYLE: ${this.settings.style} comic book front cover. Masterpiece.
+                TITLE: "INFINITE HEROES" (Bold, top).
+                SUBTITLE: "${this.settings.arena.toUpperCase()}" (Bottom).
+                SUBJECT: A group shot of the fighters preparing for battle.
+                INSTRUCTIONS:
+                - Use the provided REFERENCES for character appearances.
+                - Dynamic composition, epic lighting.
+                - Arrange them in a classic team poster style.
+            `;
+            contents.push({ text: prompt });
+
+            const res = await this.genAI.models.generateContent({
+                model: "gemini-3-pro-image-preview",
+                contents: contents,
+                config: { imageConfig: { aspectRatio: '2:3' } } // Portrait
+            });
+
+            const part = res.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);
+            if (part?.inlineData?.data) {
+                this.frontCoverUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+                
+                const buffer = Buffer.from(part.inlineData.data, 'base64');
+                const attachment = new AttachmentBuilder(buffer, { name: 'front_cover.png' });
+                await this.channel.send({ content: "**Tournament Cover Issue #1**", files: [attachment] });
+            }
+        } catch (e) {
+            console.error("Front Cover Gen Failed", e);
+            await this.channel.send("⚠️ Failed to generate cover art.");
+        }
     }
 
     private generateBracket() {
@@ -134,41 +192,67 @@ export class BattleManager {
             }
         }
 
-        const match = this.matchQueue.shift();
+        const match = this.matchQueue[0]; // Peek at the match, don't shift yet
         if (!match) return;
 
         const { p1, p2 } = match;
 
-        await this.channel.send(`🥊 **Round ${this.round}**: ${p1.username} vs ${p2.username}!`);
+        // Initialize Match Rounds if starting
+        if (this.currentMatchRounds === 0) {
+            const aliveCount = Array.from(this.players.values()).filter(p => p.status === 'ALIVE').length;
+            // If it's the final match (2 players left) or a 1v1 lobby, use 3 rounds. Else 2.
+            this.targetMatchRounds = (aliveCount <= 2) ? 3 : 2;
+            await this.channel.send(`🥊 **Match Start**: ${p1.username} vs ${p2.username}! (Best of ${this.targetMatchRounds} Scenes)`);
+        }
+
+        this.currentMatchRounds++;
+        await this.channel.send(`🎬 **Scene ${this.currentMatchRounds}/${this.targetMatchRounds}**`);
 
         try {
-            // --- SCENE 1: HEAD TO HEAD ---
-            const headToHeadUrl = await this.generateHeadToHead(p1, p2);
-            if (headToHeadUrl) {
-                const buffer = Buffer.from(headToHeadUrl.split(',')[1], 'base64');
-                const attachment = new AttachmentBuilder(buffer, { name: 'h2h.png' });
-                await this.channel.send({ content: "**FIGHTERS APPROACH!**", files: [attachment] });
-            } else {
-                // Debug message if image fails
-                // await this.channel.send("⚠️ H2H Image generation failed (API Error or Safety).");
+            // --- SCENE 1: HEAD TO HEAD (Only on first round of match) ---
+            let headToHeadUrl = "";
+            if (this.currentMatchRounds === 1) {
+                headToHeadUrl = await this.generateHeadToHead(p1, p2);
+                if (headToHeadUrl) {
+                    const buffer = Buffer.from(headToHeadUrl.split(',')[1], 'base64');
+                    const attachment = new AttachmentBuilder(buffer, { name: 'h2h.png' });
+                    await this.channel.send({ content: "**FIGHTERS APPROACH!**", files: [attachment] });
+                }
             }
 
             // --- SCENE 2: ACTION SEQUENCE ---
             const { narrative, imageUrl } = await this.generateActionSequence(p1, p2);
 
-            // Determine Winner (Random for now - TODO: Add stats logic)
-            const winner = Math.random() > 0.5 ? p1 : p2;
-            const loser = winner === p1 ? p2 : p1;
+            // Determine Round Winner (Narrative only unless it's the final round)
+            // For simplicity, we just narrate the exchange.
+            
+            const isFinalRound = this.currentMatchRounds >= this.targetMatchRounds;
+            
+            let winner: BattlePlayer | undefined;
+            let loser: BattlePlayer | undefined;
 
-            // Update Stats
-            winner.roundWins++;
-            loser.status = 'ELIMINATED';
+            if (isFinalRound) {
+                // Determine Match Winner
+                winner = Math.random() > 0.5 ? p1 : p2;
+                loser = winner === p1 ? p2 : p1;
+                
+                // Update Stats
+                winner.roundWins++;
+                loser.status = 'ELIMINATED';
+                
+                // Remove match from queue
+                this.matchQueue.shift();
+                this.currentMatchRounds = 0; // Reset for next match
+            } else {
+                // Just a scene, no elimination yet
+                // Maybe give a slight edge in narrative?
+            }
 
             // Send Result
             const embed = new EmbedBuilder()
-                .setTitle(`Round ${this.round} Result`)
-                .setDescription(`**${p1.username}** vs **${p2.username}**\n\n${narrative}\n\n🏆 **Winner:** ${winner.username}`)
-                .setColor(0xFF0000);
+                .setTitle(`Scene ${this.currentMatchRounds} Result`)
+                .setDescription(`**${p1.username}** vs **${p2.username}**\n\n${narrative}\n\n${isFinalRound ? `🏆 **Match Winner:** ${winner!.username}` : "The battle continues..."}`)
+                .setColor(isFinalRound ? 0xFFD700 : 0x3498DB);
 
             const files: AttachmentBuilder[] = [];
             if (imageUrl && imageUrl.startsWith('data:image')) {
@@ -177,8 +261,6 @@ export class BattleManager {
                 const attachment = new AttachmentBuilder(buffer, { name: 'action.png' });
                 embed.setImage('attachment://action.png');
                 files.push(attachment);
-            } else {
-                 // await this.channel.send("⚠️ Action Image generation failed.");
             }
 
             await this.channel.send({ embeds: [embed], files });
@@ -186,8 +268,8 @@ export class BattleManager {
             // Save History
             this.history.push({
                 roundNumber: this.round,
-                winnerId: winner.id,
-                loserId: loser.id,
+                winnerId: winner ? winner.id : "TBD",
+                loserId: loser ? loser.id : "TBD",
                 narrative,
                 imageUrl,
                 headToHeadUrl
@@ -195,7 +277,7 @@ export class BattleManager {
 
             this.round++;
             
-            // Continue to next match
+            // Continue
             setTimeout(() => this.processRound(), 8000); 
 
         } catch (error) {
@@ -203,6 +285,8 @@ export class BattleManager {
             await this.channel.send("❌ An error occurred during the round. Skipping...");
             // Force eliminate one to prevent infinite loop
             p2.status = 'ELIMINATED';
+            this.matchQueue.shift(); // Remove broken match
+            this.currentMatchRounds = 0;
             this.processRound();
         }
     }
@@ -239,7 +323,7 @@ export class BattleManager {
             ` });
 
             const imgRes = await this.genAI.models.generateContent({
-                model: "gemini-2.0-flash-exp",
+                model: "gemini-3-pro-image-preview",
                 contents: contents
             });
             
@@ -271,7 +355,7 @@ export class BattleManager {
         let narrative = "The fighters clash!";
         try {
             const textRes = await this.genAI.models.generateContent({
-                model: "gemini-1.5-flash",
+                model: "gemini-2.0-flash-exp", // Updated to valid model
                 contents: narrativePrompt
             });
             // Safely extract text
@@ -298,7 +382,7 @@ export class BattleManager {
             ` });
 
             const imgRes = await this.genAI.models.generateContent({
-                model: "gemini-2.0-flash-exp", // Updated to a model that might support image gen or at least is valid
+                model: "gemini-3-pro-image-preview", // Updated to a model that might support image gen or at least is valid
                 contents: contents,
                 // config: { responseMimeType: 'application/json' } // Removed as it might conflict with image gen
             });
@@ -325,29 +409,58 @@ export class BattleManager {
         if (winner) {
             await this.channel.send(`🏆 **TOURNAMENT CHAMPION:** ${winner.username}!\nGenerating victory package... (This may take a moment)`);
 
-            try {
-                const winnerImg = await this.fetchImageAsBase64(winner.avatarUrl);
-                
-                // --- VEO VIDEO PROMPT ---
-                const veoPrompt = `
-                    **VEO VIDEO PROMPT:**
-                    Create a cinematic victory video for ${winner.username}.
-                    Setting: ${this.settings.arena}.
-                    Action: The champion stands triumphant, raising their arms in victory. Confetti falls.
-                    Style: ${this.settings.style} animation.
-                `;
-                
-                await this.channel.send({ 
-                    content: `🎥 **Champion Video Prompt (VEO):**\n\`\`\`${veoPrompt}\`\`\`\n*(Copy this prompt to generate your video!)*` 
-                });
+            let winnerRefUrl = winner.avatarUrl;
+            let winnerImg = "";
 
+            try {
+                // Fetch image to base64 for generation and for Discord attachment
+                winnerImg = await this.fetchImageAsBase64(winner.avatarUrl);
+                
+                if (winnerImg) {
+                    // Send image to Discord to get a public URL for Veo
+                    const buffer = Buffer.from(winnerImg, 'base64');
+                    const attachment = new AttachmentBuilder(buffer, { name: 'champion_ref.png' });
+                    const refMsg = await this.channel.send({ content: "**Champion Reference Image**", files: [attachment] });
+                    
+                    if (refMsg.attachments.size > 0) {
+                        winnerRefUrl = refMsg.attachments.first()!.url;
+                    }
+                }
+            } catch (e) {
+                console.error("Failed to process winner image for Veo:", e);
+            }
+
+            // --- VEO VIDEO PROMPT (Sent immediately) ---
+            const opponentsDefeated = winner.roundWins; // Approximate count
+            const veoPrompt = `
+                **VEO VIDEO PROMPT:**
+                Create a cinematic victory video for ${winner.username}.
+                Setting: ${this.settings.arena}.
+                Action: The champion (${winner.username}) stands triumphant, raising their arms in victory. Confetti falls.
+                Overlay Text: "CHAMPION" and "Defeated ${opponentsDefeated} Opponents".
+                Character Reference: ${winnerRefUrl}
+                Style: ${this.settings.style} animation.
+                Montage: Include quick flashes of their winning strikes.
+            `;
+            
+            await this.channel.send({ 
+                content: `🎥 **Champion Video Prompt (VEO):**\n\`\`\`${veoPrompt}\`\`\`\n*(Copy this prompt to generate your video!)*` 
+            });
+
+            try {
                 // 1. Generate Victory Montage (3-panel)
+                // Ensure we use the opponent's image if available for the clash panel
+                const loser = Array.from(this.players.values()).find(p => p.id !== winner.id);
+                const loserName = loser ? loser.username : "Opponent";
+                
                 const montagePrompt = `
                     STYLE: ${this.settings.style} comic book page, 3 distinct panels.
-                    SUBJECT: Highlights of ${winner.username}'s tournament victory.
-                    Panel 1: A fierce clash in the early rounds.
-                    Panel 2: A desperate moment turned into a counter-attack.
-                    Panel 3: The final winning strike.
+                    SUBJECT: Highlights of ${winner.username}'s tournament victory against ${loserName}.
+                    Panel 1: A fierce clash between ${winner.username} and ${loserName}.
+                    Panel 2: A desperate moment turned into a counter-attack by ${winner.username}.
+                    Panel 3: The final winning strike by ${winner.username}.
+                    REFERENCE 1: ${winner.username} (Winner)
+                    REFERENCE 2: ${loserName} (Loser)
                     ARENA: ${this.settings.arena}.
                     INSTRUCTIONS: Use REFERENCE 1 for the main character. Make it look like a cohesive comic page.
                 `;
@@ -436,8 +549,10 @@ export class BattleManager {
             });
         });
 
-        // Collect all pages: History (H2H + Action) + Victory Pages
+        // Collect all pages: Front Cover + History (H2H + Action) + Victory Pages
         const allImages: string[] = [];
+        
+        if (this.frontCoverUrl) allImages.push(this.frontCoverUrl);
         
         for (const round of this.history) {
             if (round.headToHeadUrl) allImages.push(round.headToHeadUrl);

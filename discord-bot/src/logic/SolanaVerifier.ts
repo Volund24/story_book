@@ -1,6 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { createUmi } from '@metaplex-foundation/umi-bundle-defaults';
-import { fetchDigitalAsset, mplTokenMetadata } from '@metaplex-foundation/mpl-token-metadata';
+import { fetchDigitalAsset, mplTokenMetadata, findMetadataPda, deserializeMetadata } from '@metaplex-foundation/mpl-token-metadata';
 import { publicKey } from '@metaplex-foundation/umi';
 import { getConfig } from '../db';
 
@@ -172,72 +172,84 @@ export async function verifyWalletAndGetNFTs(walletAddress: string, targetCollec
 
         const validNFTs: NFTData[] = [];
 
-        // 3. Check each NFT against the collection (Parallelized with Rate Limiting)
-        // Public RPCs have strict rate limits. We must be conservative.
-        const BATCH_SIZE = 3; 
-        const DELAY_MS = 1000; // 1 second delay between batches
-
-        const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-        for (let i = 0; i < nftMints.length; i += BATCH_SIZE) {
-            const batch = nftMints.slice(i, i + BATCH_SIZE);
+        // 3. Check each NFT against the collection (Optimized with Batch Fetching)
+        console.log(`[Verifier] Batch fetching metadata for ${nftMints.length} NFTs...`);
+        
+        // Calculate PDAs for all mints
+        const metadataPDAs = nftMints.map(mint => findMetadataPda(umi, { mint: publicKey(mint) }));
+        
+        // Chunk into 100s (Solana RPC limit for getMultipleAccounts)
+        const CHUNK_SIZE = 100;
+        
+        for (let i = 0; i < metadataPDAs.length; i += CHUNK_SIZE) {
+            const chunkPDAs = metadataPDAs.slice(i, i + CHUNK_SIZE).map(pda => pda[0]);
+            const chunkMints = nftMints.slice(i, i + CHUNK_SIZE);
             
-            await Promise.all(batch.map(async (mint) => {
-                try {
-                    const asset = await fetchDigitalAsset(umi, publicKey(mint));
+            try {
+                const accounts = await umi.rpc.getAccounts(chunkPDAs);
+                
+                // Process each account in the chunk
+                await Promise.all(accounts.map(async (account, idx) => {
+                    if (!account.exists) return;
                     
-                    // Check Collection
-                    let isMatch = false;
-                    let matchedGroup: string | undefined;
+                    try {
+                        const metadata = deserializeMetadata(account);
+                        const mint = chunkMints[idx];
+                        
+                        // Check Collection
+                        let isMatch = false;
+                        let matchedGroup: string | undefined;
 
-                    if (allowAny) {
-                        isMatch = true; 
-                        matchedGroup = "Any";
-                    } else {
-                        // 1. Check MCC (Verified Collection)
-                        if (asset.metadata.collection?.__option === 'Some' && asset.metadata.collection.value.verified) {
-                            const collectionKey = asset.metadata.collection.value.key.toString();
-                            if (validCollections.has(collectionKey)) {
-                                isMatch = true;
-                                matchedGroup = validCollections.get(collectionKey);
-                            }
-                        }
-
-                        // 2. Check Creators (if not matched yet)
-                        if (!isMatch && asset.metadata.creators.__option === 'Some') {
-                            for (const creator of asset.metadata.creators.value) {
-                                if (creator.verified && validCollections.has(creator.address.toString())) {
+                        if (allowAny) {
+                            isMatch = true; 
+                            matchedGroup = "Any";
+                        } else {
+                            // 1. Check MCC (Verified Collection)
+                            if (metadata.collection?.__option === 'Some' && metadata.collection.value.verified) {
+                                const collectionKey = metadata.collection.value.key.toString();
+                                if (validCollections.has(collectionKey)) {
                                     isMatch = true;
-                                    matchedGroup = validCollections.get(creator.address.toString());
-                                    break;
+                                    matchedGroup = validCollections.get(collectionKey);
+                                }
+                            }
+
+                            // 2. Check Creators (if not matched yet)
+                            if (!isMatch && metadata.creators.__option === 'Some') {
+                                for (const creator of metadata.creators.value) {
+                                    if (creator.verified && validCollections.has(creator.address.toString())) {
+                                        isMatch = true;
+                                        matchedGroup = validCollections.get(creator.address.toString());
+                                        break;
+                                    }
                                 }
                             }
                         }
+
+                        if (isMatch) {
+                            // Fetch JSON Metadata (Image, Attributes)
+                            try {
+                                const response = await fetch(metadata.uri);
+                                if (response.ok) {
+                                    const json = await response.json();
+                                    validNFTs.push({
+                                        name: metadata.name,
+                                        image: json.image,
+                                        attributes: json.attributes || [],
+                                        mint: mint,
+                                        collectionName: metadata.symbol,
+                                        collectionGroup: matchedGroup
+                                    });
+                                }
+                            } catch (err) {
+                                console.warn(`Failed to fetch JSON for matched NFT ${mint}:`, err);
+                            }
+                        }
+                    } catch (e) {
+                        console.warn(`Failed to deserialize/process metadata for mint ${chunkMints[idx]}`, e);
                     }
-
-                    if (isMatch) {
-                        // Fetch JSON Metadata (Image, Attributes)
-                        const response = await fetch(asset.metadata.uri);
-                        const json = await response.json();
-
-                        validNFTs.push({
-                            name: asset.metadata.name,
-                            image: json.image,
-                            attributes: json.attributes || [],
-                            mint: mint,
-                            collectionName: asset.metadata.symbol,
-                            collectionGroup: matchedGroup
-                        });
-                    }
-                } catch (e) {
-                    // Only log critical errors, suppress 429s if they are handled by retries or just skip
-                    // console.warn(`Failed to fetch metadata for mint ${mint}`, e);
-                }
-            }));
-
-            // Add delay between batches to respect rate limits
-            if (i + BATCH_SIZE < nftMints.length) {
-                await sleep(DELAY_MS);
+                }));
+            } catch (e) {
+                console.error(`Failed to fetch batch of accounts`, e);
             }
         }
         

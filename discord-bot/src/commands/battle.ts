@@ -412,8 +412,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         if (lobby.autoStartTimer) clearTimeout(lobby.autoStartTimer);
         if (lobby.countdownInterval) clearInterval(lobby.countdownInterval);
 
-        await startBattleLogic(interaction.channel as TextChannel, lobby);
         await interaction.reply({ content: "🚀 Battle Started Manually!", ephemeral: true });
+        await startBattleLogic(interaction.channel as TextChannel, lobby);
     }
 }
 

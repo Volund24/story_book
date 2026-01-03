@@ -31,13 +31,13 @@ If you have the `deploy_remote.sh` script set up:
 
 3. **Build the Docker Image:**
    ```bash
-   docker build -t infinite-heroes-bot .
+   docker build -t tournament-bot .
    ```
 
 4. **Stop and Remove Old Container:**
    ```bash
-   docker stop infinite-heroes-bot || true
-   docker rm infinite-heroes-bot || true
+   docker stop tournament-bot || true
+   docker rm tournament-bot || true
    ```
 
 5. **Run the New Container:**
@@ -45,15 +45,15 @@ If you have the `deploy_remote.sh` script set up:
    
    ```bash
    docker run -d \
-     --name infinite-heroes-bot \
+     --name tournament-bot \
      --restart unless-stopped \
      --env-file .env \
      -v $(pwd)/data:/app/data \
-     infinite-heroes-bot
+     tournament-bot
    ```
 
 ## 3. Verification
 Check the logs to ensure the bot started correctly:
 ```bash
-docker logs -f infinite-heroes-bot
+docker logs -f tournament-bot
 ```

@@ -562,12 +562,17 @@ export class BattleManager {
                 if (mPart?.inlineData?.data) montageUrl = `data:${mPart.inlineData.mimeType};base64,${mPart.inlineData.data}`;
 
                 // 2. Generate Back Cover
+                const victoryProps = ["Heavyweight Championship Belt", "Golden Trophy", "Diamond Crown", "Pile of Gold Bars", "Golden Statue of Themselves", "Mystical Glowing Orb"];
+                const randomProp = victoryProps[Math.floor(Math.random() * victoryProps.length)];
+                
+                const winningTeamText = winner.teamId ? `WINNER: ${winner.teamId.replace('_', ' ')}` : "TOURNAMENT CHAMPION";
+
                 const coverPrompt = `
                     STYLE: ${this.settings.style} comic book full-page back cover art. Masterpiece.
                     SCENE: ${winner.username} celebrating their victory in the ${this.settings.arena}.
-                    ACTION: They are holding/wearing a Golden Crown.
+                    ACTION: They are holding/wearing a ${randomProp}.
                     ATMOSPHERE: Triumphant, epic, cinematic lighting.
-                    TEXT: "CHAMPION" (integrated into art if possible).
+                    TEXT: "${winningTeamText}" (Bold, Bottom).
                     INSTRUCTIONS: Use REFERENCE 1 for the character.
                 `;
 

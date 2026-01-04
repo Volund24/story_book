@@ -14,6 +14,7 @@ export interface BattlePlayer {
     status: 'ALIVE' | 'ELIMINATED' | 'WINNER';
     roundWins: number;
     nftAttributes?: any[]; // For styling based on NFT traits
+    teamId?: string; // For Gang Mode
 }
 
 export interface BattleSettings {
@@ -81,7 +82,20 @@ export class BattleManager {
     async startBattle() {
         this.status = 'IN_PROGRESS';
         this.round = 1;
-        await this.channel.send({ content: `⚔️ **The Battle Begins!** ⚔️\nArena: **${this.settings.arena}** | Genre: **${this.settings.genre}**` });
+        
+        // Assign Teams for Gang Mode
+        if (this.settings.genre === 'GANG_MODE') {
+            const players = Array.from(this.players.values());
+            // Split evenly: First half Team A, Second half Team B
+            const mid = Math.ceil(players.length / 2);
+            players.forEach((p, i) => {
+                p.teamId = i < mid ? 'TEAM_A' : 'TEAM_B';
+            });
+            
+            await this.channel.send({ content: `⚔️ **GANG WAR BEGINS!** ⚔️\n**Team A** vs **Team B**\nArena: **${this.settings.arena}**` });
+        } else {
+            await this.channel.send({ content: `⚔️ **The Battle Begins!** ⚔️\nArena: **${this.settings.arena}** | Genre: **${this.settings.genre}**` });
+        }
         
         // Generate Front Cover
         await this.generateFrontCover();
@@ -110,10 +124,19 @@ export class BattleManager {
                 }
             }
 
+            // Dynamic Title Generation
+            const suffixes = ["WARS", "CHRONICLES", "SHOWDOWN", "CLASH", "SAGA", "CONFRONTATION"];
+            const randomSuffix = suffixes[Math.floor(Math.random() * suffixes.length)];
+            const title = `${this.settings.arena.toUpperCase()} ${randomSuffix}`;
+            
+            // Dynamic Subtitle
+            const modes = ["BATTLE ROYALE", "GANG WARS", "TOURNAMENT ARC", "DEATHMATCH"];
+            const subtitle = modes[Math.floor(Math.random() * modes.length)];
+
             const prompt = `
                 STYLE: ${this.settings.style} comic book front cover. Masterpiece.
-                TITLE: "INFINITE HEROES" (Bold, top).
-                SUBTITLE: "${this.settings.arena.toUpperCase()}" (Bottom).
+                TITLE: "${title}" (Bold, top).
+                SUBTITLE: "${subtitle}" (Bottom).
                 SUBJECT: A group shot of the fighters preparing for battle.
                 INSTRUCTIONS:
                 - Use the provided REFERENCES for character appearances.
@@ -144,24 +167,41 @@ export class BattleManager {
 
     private generateBracket() {
         const alivePlayers = Array.from(this.players.values()).filter(p => p.status === 'ALIVE');
-        
-        // Shuffle
-        for (let i = alivePlayers.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [alivePlayers[i], alivePlayers[j]] = [alivePlayers[j], alivePlayers[i]];
-        }
-
         this.matchQueue = [];
-        // Pair up
-        for (let i = 0; i < alivePlayers.length; i += 2) {
-            if (i + 1 < alivePlayers.length) {
-                this.matchQueue.push({ p1: alivePlayers[i], p2: alivePlayers[i+1] });
-            } else {
-                // Odd number, bye round? Or handle differently. 
-                // For now, auto-win or wait? 
-                // Let's just push them as a "bye" (p2 is same as p1, handle in logic)
-                // Actually, better to just leave them in 'ALIVE' and they fight next round winners.
-                // But for simplicity in this loop, let's just add them to the next pool implicitly.
+
+        if (this.settings.genre === 'GANG_MODE') {
+            // Gang Mode: Pair Team A vs Team B
+            const teamA = alivePlayers.filter(p => p.teamId === 'TEAM_A');
+            const teamB = alivePlayers.filter(p => p.teamId === 'TEAM_B');
+
+            // Shuffle both teams
+            for (let i = teamA.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [teamA[i], teamA[j]] = [teamA[j], teamA[i]];
+            }
+            for (let i = teamB.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [teamB[i], teamB[j]] = [teamB[j], teamB[i]];
+            }
+
+            // Pair up
+            const maxMatches = Math.min(teamA.length, teamB.length);
+            for (let i = 0; i < maxMatches; i++) {
+                this.matchQueue.push({ p1: teamA[i], p2: teamB[i] });
+            }
+            // Extras sit out this round (remain ALIVE)
+        } else {
+            // Standard Battle Royale: Random Shuffle
+            for (let i = alivePlayers.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [alivePlayers[i], alivePlayers[j]] = [alivePlayers[j], alivePlayers[i]];
+            }
+
+            // Pair up
+            for (let i = 0; i < alivePlayers.length; i += 2) {
+                if (i + 1 < alivePlayers.length) {
+                    this.matchQueue.push({ p1: alivePlayers[i], p2: alivePlayers[i+1] });
+                }
             }
         }
     }
@@ -169,17 +209,38 @@ export class BattleManager {
     async processRound() {
         // Check if we have matches in the queue
         if (this.matchQueue.length === 0) {
-            // Check if we have a winner
             const alivePlayers = Array.from(this.players.values()).filter(p => p.status === 'ALIVE');
-            
-            if (alivePlayers.length === 1) {
-                await this.endBattle(alivePlayers[0]);
-                return;
-            }
-            
-            if (alivePlayers.length === 0) {
-                await this.endBattle(); // Draw?
-                return;
+
+            if (this.settings.genre === 'GANG_MODE') {
+                // Check Team Victory
+                const teamAAlive = alivePlayers.filter(p => p.teamId === 'TEAM_A');
+                const teamBAlive = alivePlayers.filter(p => p.teamId === 'TEAM_B');
+
+                if (teamAAlive.length === 0 && teamBAlive.length > 0) {
+                    await this.channel.send(`🏆 **TEAM B WINS THE GANG WAR!** 🏆`);
+                    await this.endBattle(teamBAlive[0]); // MVP
+                    return;
+                } else if (teamBAlive.length === 0 && teamAAlive.length > 0) {
+                    await this.channel.send(`🏆 **TEAM A WINS THE GANG WAR!** 🏆`);
+                    await this.endBattle(teamAAlive[0]); // MVP
+                    return;
+                } else if (teamAAlive.length === 0 && teamBAlive.length === 0) {
+                    await this.channel.send("💀 **MUTUAL DESTRUCTION!** No winners.");
+                    await this.endBattle();
+                    return;
+                }
+                // If both teams still have players, continue to next round
+            } else {
+                // Standard Victory Check
+                if (alivePlayers.length === 1) {
+                    await this.endBattle(alivePlayers[0]);
+                    return;
+                }
+                
+                if (alivePlayers.length === 0) {
+                    await this.endBattle(); // Draw?
+                    return;
+                }
             }
 
             // Generate next round bracket
@@ -610,7 +671,7 @@ export class BattleManager {
         doc.end();
         const pdfBuffer = await pdfPromise;
 
-        const attachment = new AttachmentBuilder(pdfBuffer, { name: 'Infinite-Heroes-Tournament.pdf' });
+        const attachment = new AttachmentBuilder(pdfBuffer, { name: 'Moonshiners-Tourney-bot.pdf' });
         await this.channel.send({
             content: "✅ **Full Tournament Comic Ready!** Download below.",
             files: [attachment]

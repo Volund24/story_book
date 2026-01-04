@@ -412,6 +412,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         if (lobby.autoStartTimer) clearTimeout(lobby.autoStartTimer);
         if (lobby.countdownInterval) clearInterval(lobby.countdownInterval);
 
+        if (!interaction.channel) {
+            await interaction.reply({ content: "❌ Error: Channel context not found.", ephemeral: true });
+            return;
+        }
+
         await interaction.reply({ content: "🚀 Battle Started Manually!", ephemeral: true });
         try {
             await startBattleLogic(interaction.channel as TextChannel, lobby);

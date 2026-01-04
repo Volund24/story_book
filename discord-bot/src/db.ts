@@ -109,20 +109,31 @@ class PocketBaseAdapter implements DBAdapter {
     }
 
     async getConfig(key: string) {
+        const clientId = process.env.CLIENT_ID || 'default';
+        const scopedKey = `${clientId}:${key}`;
+
         try {
-            const record = await this.pb.collection('config').getFirstListItem(`key="${key}"`);
+            const record = await this.pb.collection('config').getFirstListItem(`key="${scopedKey}"`);
             return record.value;
         } catch (e) {
-            return undefined;
+            try {
+                const record = await this.pb.collection('config').getFirstListItem(`key="${key}"`);
+                return record.value;
+            } catch (e2) {
+                return undefined;
+            }
         }
     }
 
     async setConfig(key: string, value: string) {
+        const clientId = process.env.CLIENT_ID || 'default';
+        const scopedKey = `${clientId}:${key}`;
+
         try {
-            const record = await this.pb.collection('config').getFirstListItem(`key="${key}"`);
+            const record = await this.pb.collection('config').getFirstListItem(`key="${scopedKey}"`);
             await this.pb.collection('config').update(record.id, { value });
         } catch (e) {
-            await this.pb.collection('config').create({ key, value });
+            await this.pb.collection('config').create({ key: scopedKey, value });
         }
     }
 }
@@ -183,12 +194,20 @@ class SQLiteAdapter implements DBAdapter {
     }
 
     async getConfig(key: string) {
-        const result = await this.db.get('SELECT value FROM config WHERE key = ?', key);
+        const clientId = process.env.CLIENT_ID || 'default';
+        const scopedKey = `${clientId}:${key}`;
+
+        let result = await this.db.get('SELECT value FROM config WHERE key = ?', scopedKey);
+        if (result) return result.value;
+
+        result = await this.db.get('SELECT value FROM config WHERE key = ?', key);
         return result?.value;
     }
 
     async setConfig(key: string, value: string) {
-        await this.db.run('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', key, value);
+        const clientId = process.env.CLIENT_ID || 'default';
+        const scopedKey = `${clientId}:${key}`;
+        await this.db.run('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', scopedKey, value);
     }
 }
 
@@ -282,20 +301,36 @@ class PostgresAdapter implements DBAdapter {
     }
 
     async getConfig(key: string) {
-        const res = await this.pool.query('SELECT value FROM config WHERE key = $1', [key]);
+        const clientId = process.env.CLIENT_ID || 'default';
+        const scopedKey = `${clientId}:${key}`;
+
+        // Try scoped key first
+        let res = await this.pool.query('SELECT value FROM config WHERE key = $1', [scopedKey]);
+        if (res.rows[0]) return res.rows[0].value;
+
+        // Fallback to global key
+        res = await this.pool.query('SELECT value FROM config WHERE key = $1', [key]);
         return res.rows[0]?.value;
     }
 
     async setConfig(key: string, value: string) {
+        const clientId = process.env.CLIENT_ID || 'default';
+        const scopedKey = `${clientId}:${key}`;
+
         await this.pool.query(`
             INSERT INTO config (key, value) VALUES ($1, $2)
             ON CONFLICT (key) DO UPDATE SET value = $2
-        `, [key, value]);
+        `, [scopedKey, value]);
     }
 }
 
 // --- Factory ---
 export async function initDB() {
+    // Ensure CLIENT_ID is available for scoping
+    if (!process.env.CLIENT_ID) {
+        console.warn("Warning: CLIENT_ID not set. Configs will use 'default' scope.");
+    }
+    
     if (process.env.POCKETBASE_URL) {
         console.log("Using PocketBase Database");
         adapter = new PocketBaseAdapter(process.env.POCKETBASE_URL);

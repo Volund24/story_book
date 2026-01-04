@@ -413,7 +413,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         if (lobby.countdownInterval) clearInterval(lobby.countdownInterval);
 
         await interaction.reply({ content: "🚀 Battle Started Manually!", ephemeral: true });
-        await startBattleLogic(interaction.channel as TextChannel, lobby);
+        try {
+            await startBattleLogic(interaction.channel as TextChannel, lobby);
+        } catch (e: any) {
+            console.error("Battle Start Error:", e);
+            await interaction.followUp({ content: `❌ Battle crashed: ${e.message}`, ephemeral: true });
+        }
     }
 }
 

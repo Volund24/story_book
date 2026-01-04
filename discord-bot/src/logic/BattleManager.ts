@@ -221,7 +221,12 @@ export class BattleManager {
             }
 
             // --- SCENE 2: ACTION SEQUENCE ---
-            const { narrative, imageUrl } = await this.generateActionSequence(p1, p2);
+            let { narrative, imageUrl } = await this.generateActionSequence(p1, p2);
+
+            // Overlay Text on Image
+            if (imageUrl && imageUrl.startsWith('data:image')) {
+                imageUrl = await this.overlayComicText(imageUrl, narrative);
+            }
 
             // Determine Round Winner (Narrative only unless it's the final round)
             // For simplicity, we just narrate the exchange.
@@ -411,23 +416,35 @@ export class BattleManager {
 
             let winnerRefUrl = winner.avatarUrl;
             let winnerImg = "";
+            let loserRefUrl = "";
+            let loserImg = "";
+            
+            // Identify Loser (Runner-up)
+            const loser = Array.from(this.players.values()).find(p => p.id !== winner.id);
+            const loserName = loser ? loser.username : "Opponent";
 
             try {
-                // Fetch image to base64 for generation and for Discord attachment
+                // Fetch Winner Image
                 winnerImg = await this.fetchImageAsBase64(winner.avatarUrl);
-                
                 if (winnerImg) {
-                    // Send image to Discord to get a public URL for Veo
                     const buffer = Buffer.from(winnerImg, 'base64');
                     const attachment = new AttachmentBuilder(buffer, { name: 'champion_ref.png' });
                     const refMsg = await this.channel.send({ content: "**Champion Reference Image**", files: [attachment] });
-                    
-                    if (refMsg.attachments.size > 0) {
-                        winnerRefUrl = refMsg.attachments.first()!.url;
+                    if (refMsg.attachments.size > 0) winnerRefUrl = refMsg.attachments.first()!.url;
+                }
+
+                // Fetch Loser Image
+                if (loser) {
+                    loserImg = await this.fetchImageAsBase64(loser.avatarUrl);
+                    if (loserImg) {
+                        const buffer = Buffer.from(loserImg, 'base64');
+                        const attachment = new AttachmentBuilder(buffer, { name: 'loser_ref.png' });
+                        const refMsg = await this.channel.send({ content: "**Runner-up Reference Image**", files: [attachment] });
+                        if (refMsg.attachments.size > 0) loserRefUrl = refMsg.attachments.first()!.url;
                     }
                 }
             } catch (e) {
-                console.error("Failed to process winner image for Veo:", e);
+                console.error("Failed to process reference images:", e);
             }
 
             // --- VEO VIDEO PROMPT (Sent immediately) ---
@@ -436,11 +453,12 @@ export class BattleManager {
                 **VEO VIDEO PROMPT:**
                 Create a cinematic victory video for ${winner.username}.
                 Setting: ${this.settings.arena}.
-                Action: The champion (${winner.username}) stands triumphant, raising their arms in victory. Confetti falls.
+                Action: The champion (${winner.username}) stands triumphant.
+                Include a flashback sequence of them defeating ${loserName}.
                 Overlay Text: "CHAMPION" and "Defeated ${opponentsDefeated} Opponents".
-                Character Reference: ${winnerRefUrl}
+                Character Reference 1 (Champion): ${winnerRefUrl}
+                Character Reference 2 (Opponent): ${loserRefUrl}
                 Style: ${this.settings.style} animation.
-                Montage: Include quick flashes of their winning strikes.
             `;
             
             await this.channel.send({ 
@@ -449,10 +467,6 @@ export class BattleManager {
 
             try {
                 // 1. Generate Victory Montage (3-panel)
-                // Ensure we use the opponent's image if available for the clash panel
-                const loser = Array.from(this.players.values()).find(p => p.id !== winner.id);
-                const loserName = loser ? loser.username : "Opponent";
-                
                 const montagePrompt = `
                     STYLE: ${this.settings.style} comic book page, 3 distinct panels.
                     SUBJECT: Highlights of ${winner.username}'s tournament victory against ${loserName}.
@@ -462,14 +476,20 @@ export class BattleManager {
                     REFERENCE 1: ${winner.username} (Winner)
                     REFERENCE 2: ${loserName} (Loser)
                     ARENA: ${this.settings.arena}.
-                    INSTRUCTIONS: Use REFERENCE 1 for the main character. Make it look like a cohesive comic page.
+                    INSTRUCTIONS: Use REFERENCE 1 for the main character. Use REFERENCE 2 for the opponent. Make it look like a cohesive comic page.
                 `;
 
-                const montageContents = [
+                const montageContents: any[] = [
                     { text: "REFERENCE 1 [CHAMPION]:" },
-                    { inlineData: { mimeType: 'image/png', data: winnerImg } },
-                    { text: montagePrompt }
+                    { inlineData: { mimeType: 'image/png', data: winnerImg } }
                 ];
+
+                if (loserImg) {
+                    montageContents.push({ text: "REFERENCE 2 [OPPONENT]:" });
+                    montageContents.push({ inlineData: { mimeType: 'image/png', data: loserImg } });
+                }
+
+                montageContents.push({ text: montagePrompt });
 
                 const montageRes = await this.genAI.models.generateContent({
                     model: "gemini-3-pro-image-preview",
@@ -595,5 +615,49 @@ export class BattleManager {
             content: "✅ **Full Tournament Comic Ready!** Download below.",
             files: [attachment]
         });
+    }
+
+    private async overlayComicText(base64Image: string, text: string): Promise<string> {
+        try {
+            const buffer = Buffer.from(base64Image.split(',')[1], 'base64');
+            const image = await Jimp.read(buffer);
+            const font = await Jimp.loadFont(Jimp.FONT_SANS_16_BLACK);
+            
+            const maxWidth = image.bitmap.width - 40;
+            const textHeight = Jimp.measureTextHeight(font, text, maxWidth);
+            
+            // Draw white box at bottom
+            const boxHeight = textHeight + 20;
+            const boxY = image.bitmap.height - boxHeight - 20;
+            
+            // Create a new image for the box to support opacity if needed, 
+            // but for now just scan and set pixels or use a composite
+            // Jimp doesn't have a simple "drawRect", so we iterate or use a plugin.
+            // Simpler: Composite a white image.
+            const whiteBox = new Jimp(image.bitmap.width - 20, boxHeight, 0xFFFFFFFF);
+            whiteBox.opacity(0.9);
+            
+            image.composite(whiteBox, 10, boxY);
+            
+            // Print text
+            image.print(
+                font, 
+                20, 
+                boxY + 10, 
+                {
+                    text: text,
+                    alignmentX: Jimp.HORIZONTAL_ALIGN_CENTER,
+                    alignmentY: Jimp.VERTICAL_ALIGN_MIDDLE
+                },
+                maxWidth,
+                boxHeight
+            );
+
+            const processedBuffer = await image.getBufferAsync(Jimp.MIME_PNG);
+            return `data:image/png;base64,${processedBuffer.toString('base64')}`;
+        } catch (e) {
+            console.error("Failed to overlay text:", e);
+            return base64Image; // Return original on failure
+        }
     }
 }

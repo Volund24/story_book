@@ -370,7 +370,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
                     if (activeLobbies.has(channelId)) {
                         const currentLobby = activeLobbies.get(channelId);
                         if (currentLobby && currentLobby.status === 'OPEN') {
-                            await startBattleLogic(interaction.channel as TextChannel, currentLobby);
+                            try {
+                                const channel = await interaction.client.channels.fetch(channelId) as TextChannel;
+                                if (channel) {
+                                    await startBattleLogic(channel, currentLobby);
+                                } else {
+                                    console.error("Auto-start failed: Channel not found");
+                                    activeLobbies.delete(channelId);
+                                }
+                            } catch (e) {
+                                console.error("Auto-start error:", e);
+                            }
                         }
                     }
                 }, 300000); // 5 minutes
@@ -398,14 +408,20 @@ export async function execute(interaction: ChatInputCommandInteraction) {
             return;
         }
 
-        // Enforce Even Brackets (Powers of 2: 2, 4, 8, 16)
-        const validCounts = [2, 4, 8, 16];
-        // Gang Mode Exception
+        // Enforce Even Brackets (2-24)
         const isGangMode = lobby.settings.genre === 'GANG_MODE'; 
         
-        if (!isGangMode && !validCounts.includes(lobby.players.length)) {
-             await interaction.reply({ content: `❌ **Even Brackets Enforced!**\nCurrent player count: ${lobby.players.length}.\nRequired: 2, 4, 8, or 16 players.\n\nPlease wait for more players or kick someone to match the bracket.`, ephemeral: true });
-             return;
+        if (isGangMode) {
+             const validGangCounts = [4, 8, 16];
+             if (!validGangCounts.includes(lobby.players.length)) {
+                 await interaction.reply({ content: `❌ **Gang Mode Requires 4, 8, or 16 Players!**\nCurrent count: ${lobby.players.length}.\n\nPlease wait for more players or kick someone to match the bracket.`, ephemeral: true });
+                 return;
+             }
+        } else {
+            if (lobby.players.length < 2 || lobby.players.length > 24 || lobby.players.length % 2 !== 0) {
+                 await interaction.reply({ content: `❌ **Even Brackets Enforced!**\nCurrent player count: ${lobby.players.length}.\nRequired: Even number between 2 and 24.\n\nPlease wait for more players or kick someone to match the bracket.`, ephemeral: true });
+                 return;
+             }
         }
 
         // Cancel auto-start if manually started
@@ -506,8 +522,8 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
             .setCustomId(`battle_create_final_${type}_${mode}_${safeVenue}`)
             .setTitle('Final Settings');
 
-        let playersLabel = "Max Players (2, 4, 8, 16)";
-        let defaultPlayers = "2";
+        let playersLabel = "Max Players (2-24, Even Only)";
+        let defaultPlayers = "6";
 
         if (mode === 'GANG_MODE') {
             playersLabel = "Total Players (4-24, Even Only)";
@@ -552,19 +568,19 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
 
         // Enforce Bracket Rules
         if (mode === 'GANG_MODE') {
-            // Gang Mode: 4-24 players, Even numbers only
-            if (isNaN(maxPlayers) || maxPlayers < 4 || maxPlayers > 24 || maxPlayers % 2 !== 0) {
+            // Gang Mode: Powers of 2 only (4, 8, 16)
+            const validGangCounts = [4, 8, 16];
+            if (!validGangCounts.includes(maxPlayers)) {
                 await interaction.reply({ 
-                    content: "❌ **Invalid Player Count for Gang Mode!**\nMust be between 4 and 24, and an EVEN number (e.g., 6 for 3v3, 10 for 5v5).", 
+                    content: "❌ **Invalid Player Count for Gang Mode!**\nMust be 4, 8, or 16 to ensure even brackets.", 
                     ephemeral: true 
                 });
                 return;
             }
         } else {
-            // Battle Royale: Powers of 2 (2, 4, 8, 16)
-            const validCounts = [2, 4, 8, 16];
-            if (!validCounts.includes(maxPlayers)) {
-                await interaction.reply({ content: "❌ **Even Brackets Only!** Max players must be 2, 4, 8, or 16.", ephemeral: true });
+            // Battle Royale: 2-24 players, Even numbers only
+            if (isNaN(maxPlayers) || maxPlayers < 2 || maxPlayers > 24 || maxPlayers % 2 !== 0) {
+                await interaction.reply({ content: "❌ **Invalid Player Count!**\nMust be between 2 and 24, and an EVEN number.", ephemeral: true });
                 return;
             }
         }

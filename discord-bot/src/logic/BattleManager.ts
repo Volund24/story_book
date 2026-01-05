@@ -21,6 +21,8 @@ export interface BattleSettings {
     arena: string;
     genre: string;
     style: string; // e.g., "Comic Book", "Manga", "Realistic"
+    teamA?: string; // Team A Name
+    teamB?: string; // Team B Name
 }
 
 export interface RoundResult {
@@ -66,7 +68,7 @@ export class BattleManager {
         this.genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_KEY });
     }
 
-    addPlayer(playerData: { id: string; username: string; avatarUrl: string; walletAddress?: string; nftAttributes?: any[] }) {
+    addPlayer(playerData: { id: string; username: string; avatarUrl: string; walletAddress?: string; nftAttributes?: any[]; team?: 'A' | 'B' }) {
         // Gender enforcement logic: Default to Male unless explicitly detected/stated
         const gender: 'Male' | 'Female' = 'Male'; 
 
@@ -74,7 +76,8 @@ export class BattleManager {
             ...playerData,
             gender,
             status: 'ALIVE',
-            roundWins: 0
+            roundWins: 0,
+            teamId: playerData.team ? `TEAM_${playerData.team}` : undefined
         };
         this.players.set(player.id, player);
     }
@@ -85,14 +88,22 @@ export class BattleManager {
         
         // Assign Teams for Gang Mode
         if (this.settings.genre === 'GANG_MODE') {
+            // Teams are already assigned in addPlayer for Gang Mode
+            // Fallback if not assigned (e.g. legacy or error)
             const players = Array.from(this.players.values());
-            // Split evenly: First half Team A, Second half Team B
-            const mid = Math.ceil(players.length / 2);
-            players.forEach((p, i) => {
-                p.teamId = i < mid ? 'TEAM_A' : 'TEAM_B';
-            });
+            const unassigned = players.filter(p => !p.teamId);
             
-            await this.channel.send({ content: `⚔️ **GANG WAR BEGINS!** ⚔️\n**Team A** vs **Team B**\nArena: **${this.settings.arena}**` });
+            if (unassigned.length > 0) {
+                const mid = Math.ceil(unassigned.length / 2);
+                unassigned.forEach((p, i) => {
+                    p.teamId = i < mid ? 'TEAM_A' : 'TEAM_B';
+                });
+            }
+            
+            const teamAName = this.settings.teamA || "Team A";
+            const teamBName = this.settings.teamB || "Team B";
+
+            await this.channel.send({ content: `⚔️ **GANG WAR BEGINS!** ⚔️\n🔴 **${teamAName}** vs 🔵 **${teamBName}**\nArena: **${this.settings.arena}**` });
         } else {
             await this.channel.send({ content: `⚔️ **The Battle Begins!** ⚔️\nArena: **${this.settings.arena}** | Genre: **${this.settings.genre}**` });
         }
@@ -215,13 +226,16 @@ export class BattleManager {
                 // Check Team Victory
                 const teamAAlive = alivePlayers.filter(p => p.teamId === 'TEAM_A');
                 const teamBAlive = alivePlayers.filter(p => p.teamId === 'TEAM_B');
+                
+                const teamAName = this.settings.teamA || "Team A";
+                const teamBName = this.settings.teamB || "Team B";
 
                 if (teamAAlive.length === 0 && teamBAlive.length > 0) {
-                    await this.channel.send(`🏆 **TEAM B WINS THE GANG WAR!** 🏆`);
+                    await this.channel.send(`🏆 **${teamBName.toUpperCase()} WINS THE GANG WAR!** 🏆`);
                     await this.endBattle(teamBAlive[0]); // MVP
                     return;
                 } else if (teamBAlive.length === 0 && teamAAlive.length > 0) {
-                    await this.channel.send(`🏆 **TEAM A WINS THE GANG WAR!** 🏆`);
+                    await this.channel.send(`🏆 **${teamAName.toUpperCase()} WINS THE GANG WAR!** 🏆`);
                     await this.endBattle(teamAAlive[0]); // MVP
                     return;
                 } else if (teamAAlive.length === 0 && teamBAlive.length === 0) {

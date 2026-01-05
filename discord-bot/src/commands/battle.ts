@@ -36,6 +36,8 @@ interface Lobby {
         arena: string;
         genre: string;
         registrationType: 'UPLOAD' | 'PFP' | 'WALLET';
+        teamA?: { name: string, collectionId: string };
+        teamB?: { name: string, collectionId: string };
     };
     autoStartTimer?: NodeJS.Timeout;
     countdownInterval?: NodeJS.Timeout;
@@ -48,15 +50,26 @@ interface Player {
     isOnline: boolean;
     walletAddress?: string;
     nftAttributes?: any[];
+    team?: 'A' | 'B';
 }
 
 const activeLobbies: Map<string, Lobby> = new Map(); // Key: ChannelID
 const activeBattles: Map<string, BattleManager> = new Map(); // Key: ChannelID
 
+// Pending setup state for multi-step creation
+interface PendingSetup {
+    type?: 'UPLOAD' | 'PFP' | 'WALLET';
+    mode?: string;
+    teamA?: { name: string, id: string };
+    teamB?: { name: string, id: string };
+    venue?: string;
+}
+const pendingLobbySetup: Map<string, PendingSetup> = new Map(); // Key: UserId
+
 async function validateAndGetPlayerData(
     user: User,
     type: 'UPLOAD' | 'PFP' | 'WALLET',
-    options: { image?: Attachment, wallet?: string, selectedMint?: string, selectedCollectionGroup?: string }
+    options: { image?: Attachment, wallet?: string, selectedMint?: string, selectedCollectionGroup?: string, requiredCollection?: string }
 ): Promise<Player> {
     let avatarUrl = user.displayAvatarURL({ extension: 'png', size: 512 });
     let walletAddress: string | undefined;
@@ -78,11 +91,16 @@ async function validateAndGetPlayerData(
         if (!walletToUse) throw new Error("You must provide a Solana Wallet Address (or set it via /wallet set)!");
         
         // Pass the selected collection group to the verifier
-        const nfts = await verifyWalletAndGetNFTs(walletToUse, options.selectedCollectionGroup);
+        // If requiredCollection is set (Gang Mode), we MUST use it.
+        const collectionFilter = options.requiredCollection || options.selectedCollectionGroup;
+        const nfts = await verifyWalletAndGetNFTs(walletToUse, collectionFilter);
         
         if (nfts.length === 0) {
-            if (options.selectedCollectionGroup) {
-                throw new Error(`No NFTs found in wallet from collection: ${options.selectedCollectionGroup}`);
+            if (collectionFilter) {
+                // Fetch friendly name for error message
+                const collections = await getAvailableCollections();
+                const friendlyName = collections.get(collectionFilter) || collectionFilter;
+                throw new Error(`No NFTs found in wallet from collection: **${friendlyName}**`);
             } else {
                 throw new Error("No valid NFT found in this wallet!");
             }
@@ -91,7 +109,7 @@ async function validateAndGetPlayerData(
         let filteredNFTs = nfts;
 
         // Legacy check for multiple collections (should be handled before calling this now)
-        if (!options.selectedCollectionGroup) {
+        if (!options.selectedCollectionGroup && !options.requiredCollection) {
             const enablePartners = await getConfig('enable_partners') === 'true';
             if (enablePartners) {
                 const groups = Array.from(new Set(nfts.map(n => n.collectionGroup || 'Unknown'))).filter(g => g !== 'Unknown');
@@ -262,11 +280,64 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
         try {
             let player: Player;
+            let requiredCollection: string | undefined;
+            let selectedTeam: 'A' | 'B' | undefined;
+
+            // Gang Mode: Ask for Team Selection
+            if (lobby.settings.genre === 'GANG_MODE' && lobby.settings.teamA && lobby.settings.teamB) {
+                const teamA = lobby.settings.teamA;
+                const teamB = lobby.settings.teamB;
+
+                const row = new ActionRowBuilder<ButtonBuilder>()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId('join_team_a')
+                            .setLabel(`Join ${teamA.name}`)
+                            .setStyle(ButtonStyle.Danger),
+                        new ButtonBuilder()
+                            .setCustomId('join_team_b')
+                            .setLabel(`Join ${teamB.name}`)
+                            .setStyle(ButtonStyle.Primary)
+                    );
+
+                const response = await interaction.editReply({
+                    content: `⚔️ **Choose Your Side!**\n🔴 **${teamA.name}** vs 🔵 **${teamB.name}**`,
+                    components: [row]
+                });
+
+                try {
+                    const confirmation = await response.awaitMessageComponent({ 
+                        filter: i => i.user.id === interaction.user.id, 
+                        time: 60000, 
+                        componentType: ComponentType.Button 
+                    });
+
+                    if (confirmation.customId === 'join_team_a') {
+                        requiredCollection = teamA.collectionId;
+                        selectedTeam = 'A';
+                        await confirmation.update({ content: `🔴 Selected **${teamA.name}**. Verifying wallet...`, components: [] });
+                    } else {
+                        requiredCollection = teamB.collectionId;
+                        selectedTeam = 'B';
+                        await confirmation.update({ content: `🔵 Selected **${teamB.name}**. Verifying wallet...`, components: [] });
+                    }
+                } catch (e) {
+                    await interaction.editReply({ content: "❌ Selection timed out.", components: [] });
+                    return;
+                }
+            }
+
             try {
                 player = await validateAndGetPlayerData(interaction.user, lobby.settings.registrationType, {
                     image: interaction.options.getAttachment('image') || undefined,
-                    wallet: interaction.options.getString('wallet') || undefined
+                    wallet: interaction.options.getString('wallet') || undefined,
+                    requiredCollection: requiredCollection
                 });
+                
+                if (selectedTeam) {
+                    player.team = selectedTeam;
+                }
+
             } catch (error) {
                 if (error instanceof MultipleCollectionsError) {
                     // Show Select Menu for Collections
@@ -314,10 +385,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
             lobby.players.push(player);
 
-            const playerList = lobby.players.map((p, i) => `**${i + 1}.** ${p.username}`).join('\n');
+            const playerList = lobby.players.map((p, i) => `**${i + 1}.** ${p.username} ${p.team ? `(${p.team})` : ''}`).join('\n');
+            
+            let description = `**Host:** <@${lobby.hostId}>\n**Mode:** ${lobby.settings.registrationType}\n**Players:** ${lobby.players.length}/${lobby.maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`;
+            
+            if (lobby.settings.genre === 'GANG_MODE' && lobby.settings.teamA && lobby.settings.teamB) {
+                 description = `**Host:** <@${lobby.hostId}>\n**Mode:** Gang War\n**Matchup:** ${lobby.settings.teamA.name} 🆚 ${lobby.settings.teamB.name}\n**Players:** ${lobby.players.length}/${lobby.maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to pick your side!`;
+            }
+
             const updateEmbed = new EmbedBuilder()
-                .setTitle(`⚔️ BATTLE ROYALE: ${lobby.settings.arena}`)
-                .setDescription(`**Host:** <@${lobby.hostId}>\n**Mode:** ${lobby.settings.registrationType}\n**Players:** ${lobby.players.length}/${lobby.maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
+                .setTitle(`⚔️ ${lobby.settings.genre === 'GANG_MODE' ? 'GANG WAR' : 'BATTLE ROYALE'}: ${lobby.settings.arena}`)
+                .setDescription(description)
                 .addFields(
                     { name: '📜 Rules', value: '• Online players beat offline players.\n• NFT Stats based on rarity traits.' },
                     { name: '🎮 Commands', value: '• \`/battle join\` - Join Lobby\n• \`/wallet set\` - Link Wallet' }
@@ -449,7 +527,9 @@ async function startBattleLogic(channel: TextChannel, lobby: Lobby) {
     const battle = new BattleManager(channel.id, channel, {
         arena: lobby.settings.arena,
         genre: lobby.settings.genre,
-        style: "Comic Book" // Default style
+        style: "Comic Book", // Default style
+        teamA: lobby.settings.teamA?.name,
+        teamB: lobby.settings.teamB?.name
     });
 
     lobby.players.forEach(p => battle.addPlayer(p));
@@ -461,17 +541,22 @@ async function startBattleLogic(channel: TextChannel, lobby: Lobby) {
 
 // Handle Select Menu and Modals
 export async function handleInteraction(interaction: StringSelectMenuInteraction | ModalSubmitInteraction) {
+    const userId = interaction.user.id;
+
     // Step 1: Registration Type Selected -> Show Game Mode Select
     if (interaction.isStringSelectMenu() && interaction.customId === 'battle_create_type') {
-        const type = interaction.values[0];
+        const type = interaction.values[0] as 'UPLOAD' | 'PFP' | 'WALLET';
         
+        // Initialize pending setup
+        pendingLobbySetup.set(userId, { type });
+
         // Check if Gang Mode is enabled via config
         const enablePartners = await getConfig('enable_partners') === 'true';
         const partnerCollections = await getConfig('partner_collections');
         const hasPartners = enablePartners || (partnerCollections && partnerCollections.length > 0);
 
         const modeSelect = new StringSelectMenuBuilder()
-            .setCustomId(`battle_create_mode_${type}`)
+            .setCustomId(`battle_create_mode`)
             .setPlaceholder('Select Game Mode')
             .addOptions(
                 { label: 'Battle Royale', value: 'BATTLE_ROYALE', description: 'Standard Tournament Bracket (1v1)', emoji: '🏆' }
@@ -488,13 +573,87 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
         await interaction.update({ content: "⚔️ **Select Game Mode**", components: [row] });
     }
 
-    // Step 2: Game Mode Selected -> Show Venue Select
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('battle_create_mode_')) {
-        const type = interaction.customId.replace('battle_create_mode_', '') as 'UPLOAD' | 'PFP' | 'WALLET';
+    // Step 2: Game Mode Selected -> Show Venue OR Team Select
+    if (interaction.isStringSelectMenu() && interaction.customId === 'battle_create_mode') {
         const mode = interaction.values[0];
+        const setup = pendingLobbySetup.get(userId);
+        if (!setup) {
+            await interaction.reply({ content: "❌ Session expired. Please start over.", ephemeral: true });
+            return;
+        }
+        setup.mode = mode;
+        pendingLobbySetup.set(userId, setup);
+
+        if (mode === 'GANG_MODE') {
+            // Show Team A Select
+            const availableCollections = await getAvailableCollections();
+            const select = new StringSelectMenuBuilder()
+                .setCustomId('battle_create_teama')
+                .setPlaceholder('Select Team A Collection')
+                .addOptions(Array.from(availableCollections.entries()).map(([id, name]) => ({
+                    label: name.substring(0, 100),
+                    value: id
+                })));
+
+            const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+            await interaction.update({ content: "🔴 **Select Team A (Red Team)**", components: [row] });
+        } else {
+            // Show Venue Select
+            const venueSelect = new StringSelectMenuBuilder()
+                .setCustomId(`battle_create_venue`)
+                .setPlaceholder('Select Venue')
+                .addOptions(
+                    { label: 'The Void', value: 'The Void', description: 'A dark, empty expanse', emoji: '⚫' },
+                    { label: 'Cyber City', value: 'Cyber City', description: 'Neon-lit futuristic streets', emoji: '🏙️' },
+                    { label: 'Ancient Colosseum', value: 'Ancient Colosseum', description: 'Gladiator arena', emoji: '🏛️' },
+                    { label: 'Magma Chamber', value: 'Magma Chamber', description: 'Volcanic underground', emoji: '🌋' },
+                    { label: 'Sky Sanctuary', value: 'Sky Sanctuary', description: 'Floating islands', emoji: '☁️' }
+                );
+
+            const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(venueSelect);
+            await interaction.update({ content: "🏟️ **Select Venue**", components: [row] });
+        }
+    }
+
+    // Step 3: Team A Selected -> Show Team B Select
+    if (interaction.isStringSelectMenu() && interaction.customId === 'battle_create_teama') {
+        const teamAId = interaction.values[0];
+        const setup = pendingLobbySetup.get(userId);
+        if (!setup) return;
+
+        const availableCollections = await getAvailableCollections();
+        const teamAName = availableCollections.get(teamAId) || "Team A";
+        
+        setup.teamA = { name: teamAName, id: teamAId };
+        pendingLobbySetup.set(userId, setup);
+
+        // Filter out Team A from options? Maybe allow mirror match? Let's allow mirror match for now.
+        const select = new StringSelectMenuBuilder()
+            .setCustomId('battle_create_teamb')
+            .setPlaceholder('Select Team B Collection')
+            .addOptions(Array.from(availableCollections.entries()).map(([id, name]) => ({
+                label: name.substring(0, 100),
+                value: id
+            })));
+
+        const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+        await interaction.update({ content: `🔵 **Select Team B (Blue Team)**\nVs ${teamAName}`, components: [row] });
+    }
+
+    // Step 4: Team B Selected -> Show Venue Select
+    if (interaction.isStringSelectMenu() && interaction.customId === 'battle_create_teamb') {
+        const teamBId = interaction.values[0];
+        const setup = pendingLobbySetup.get(userId);
+        if (!setup) return;
+
+        const availableCollections = await getAvailableCollections();
+        const teamBName = availableCollections.get(teamBId) || "Team B";
+        
+        setup.teamB = { name: teamBName, id: teamBId };
+        pendingLobbySetup.set(userId, setup);
 
         const venueSelect = new StringSelectMenuBuilder()
-            .setCustomId(`battle_create_venue_${type}_${mode}`)
+            .setCustomId(`battle_create_venue`)
             .setPlaceholder('Select Venue')
             .addOptions(
                 { label: 'The Void', value: 'The Void', description: 'A dark, empty expanse', emoji: '⚫' },
@@ -505,27 +664,26 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
             );
 
         const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(venueSelect);
-        
         await interaction.update({ content: "🏟️ **Select Venue**", components: [row] });
     }
 
-    // Step 3: Venue Selected -> Show Final Settings Modal
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('battle_create_venue_')) {
-        const parts = interaction.customId.split('_');
-        // battle_create_venue_TYPE_MODE
-        const type = parts[3] as 'UPLOAD' | 'PFP' | 'WALLET';
-        const mode = parts[4]; 
+    // Step 5: Venue Selected -> Show Final Settings Modal
+    if (interaction.isStringSelectMenu() && interaction.customId === 'battle_create_venue') {
         const venue = interaction.values[0];
-        const safeVenue = venue.replace(/\s/g, '_');
+        const setup = pendingLobbySetup.get(userId);
+        if (!setup) return;
+
+        setup.venue = venue;
+        pendingLobbySetup.set(userId, setup);
 
         const modal = new ModalBuilder()
-            .setCustomId(`battle_create_final_${type}_${mode}_${safeVenue}`)
+            .setCustomId(`battle_create_final`)
             .setTitle('Final Settings');
 
         let playersLabel = "Max Players (2-24, Even Only)";
         let defaultPlayers = "6";
 
-        if (mode === 'GANG_MODE') {
+        if (setup.mode === 'GANG_MODE') {
             playersLabel = "Total Players (4-24, Even Only)";
             defaultPlayers = "6"; // Default to 3v3
         }
@@ -541,7 +699,7 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
             new ActionRowBuilder<TextInputBuilder>().addComponents(playersInput)
         );
 
-        if (type === 'WALLET') {
+        if (setup.type === 'WALLET') {
             const walletInput = new TextInputBuilder()
                 .setCustomId('wallet_address')
                 .setLabel("Your Wallet Address")
@@ -555,19 +713,19 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
         await interaction.showModal(modal);
     }
 
-    // Step 4: Modal Submitted -> Create Lobby
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('battle_create_final_')) {
-        const parts = interaction.customId.split('_');
-        // battle, create, final, TYPE, MODE, VENUE
-        const type = parts[3] as 'UPLOAD' | 'PFP' | 'WALLET';
-        const mode = parts[4];
-        const venue = parts.slice(5).join(' ').replace(/_/g, ' '); // Reconstruct venue
+    // Step 6: Modal Submitted -> Create Lobby
+    if (interaction.isModalSubmit() && interaction.customId === 'battle_create_final') {
+        const setup = pendingLobbySetup.get(userId);
+        if (!setup || !setup.type || !setup.mode || !setup.venue) {
+             await interaction.reply({ content: "❌ Session expired or invalid. Please start over.", ephemeral: true });
+             return;
+        }
 
         const maxPlayers = parseInt(interaction.fields.getTextInputValue('max_players'));
         const channelId = interaction.channelId!;
 
         // Enforce Bracket Rules
-        if (mode === 'GANG_MODE') {
+        if (setup.mode === 'GANG_MODE') {
             // Gang Mode: Powers of 2 only (4, 8, 16)
             const validGangCounts = [4, 8, 16];
             if (!validGangCounts.includes(maxPlayers)) {
@@ -596,105 +754,62 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
             let hostPlayer: Player | undefined;
 
             // For UPLOAD, we cannot get the image from Modal. Host must join manually.
-            if (type === 'UPLOAD') {
+            if (setup.type === 'UPLOAD') {
                 // Do not register host yet
             } else {
                 // For WALLET or PFP, try to register host
                 let wallet = undefined;
                 let selectedCollectionGroup: string | undefined;
 
-                if (type === 'WALLET') {
+                if (setup.type === 'WALLET') {
                     wallet = interaction.fields.getTextInputValue('wallet_address');
                     // Also save to DB for future convenience?
                     await updateUser(interaction.user.id, { wallet_address: wallet });
 
-                    // Check for multiple collections BEFORE verifying wallet
-                    const availableCollections = await getAvailableCollections();
+                    // If Gang Mode, Host MUST pick a team.
+                    // But we are in the creation flow. Host is creating the lobby.
+                    // Host should probably be prompted to join properly or we auto-assign if possible.
+                    // For simplicity, let's make the Host join manually via /battle join if it's Gang Mode,
+                    // OR ask them which team they are on.
+                    // Actually, let's just create the lobby empty (or with host) and let them pick team.
                     
-                    if (availableCollections.size > 1) {
-                        // Ask user to select collection
-                        const select = new StringSelectMenuBuilder()
-                            .setCustomId('battle_create_collection_select_temp')
-                            .setPlaceholder('Select a Collection')
-                            .addOptions(Array.from(availableCollections.entries()).map(([id, name]) => ({ 
-                                label: name.substring(0, 100), 
-                                value: id 
-                            })));
-                        
-                        const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
-                        
-                        const response = await interaction.editReply({
-                            content: "⚠️ **Multiple Collections Available!**\nPlease select which collection you want to use for your fighter:",
-                            components: [row]
-                        });
-
-                        try {
-                            const confirmation = await response.awaitMessageComponent({ 
-                                filter: i => i.user.id === interaction.user.id, 
-                                time: 60000, 
-                                componentType: ComponentType.StringSelect 
-                            });
-                            
-                            selectedCollectionGroup = (confirmation as StringSelectMenuInteraction).values[0];
-                            
-                            // Get the label for the selected group to show a friendly name
-                            const friendlyName = availableCollections.get(selectedCollectionGroup) || selectedCollectionGroup;
-
-                            await confirmation.update({ content: `✅ Selected **${friendlyName}**. Verifying wallet...`, components: [] });
-                        } catch (e) {
-                            await interaction.editReply({ content: "❌ Selection timed out. Lobby creation cancelled.", components: [] });
-                            return;
+                    // If Gang Mode, we can't auto-register host easily without knowing their team.
+                    // Let's skip auto-registration for Host in Gang Mode for now, OR default them to Team A?
+                    // Let's default Host to Team A for simplicity, but verify they have the NFT.
+                    
+                    if (setup.mode === 'GANG_MODE') {
+                        selectedCollectionGroup = setup.teamA!.id; // Host defaults to Team A
+                    } else {
+                        // Standard Battle Royale Logic (Multiple Collections Check)
+                        const availableCollections = await getAvailableCollections();
+                        if (availableCollections.size > 1) {
+                             // ... (Existing logic for selection, but we can't do interactive select inside modal submit easily without complex followups)
+                             // For now, let's just pick the first one or fail if multiple.
+                             // Actually, we can just let validateAndGetPlayerData handle it?
+                             // No, validate throws error.
+                             // Let's just try to validate with NO specific collection, and if it fails, tell them to join manually.
                         }
-                    } else if (availableCollections.size === 1) {
-                        selectedCollectionGroup = availableCollections.keys().next().value;
                     }
                 }
 
                 try {
-                    hostPlayer = await validateAndGetPlayerData(interaction.user, type, { wallet, selectedCollectionGroup });
-                } catch (error) {
-                    if (error instanceof MultipleCollectionsError) {
-                        // This fallback should rarely be hit now, but kept for safety
-                        const availableCollections = await getAvailableCollections();
-                        
-                        const select = new StringSelectMenuBuilder()
-                            .setCustomId('battle_create_collection_select')
-                            .setPlaceholder('Select a Collection')
-                            .addOptions(error.groups.map(g => {
-                                const name = availableCollections.get(g) || g;
-                                return { label: name.substring(0, 100), value: g };
-                            }));
-                        
-                        const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
-                        
-                        const response = await interaction.editReply({
-                            content: "⚠️ **Multiple Collections Found!**\nPlease select which collection you want to use for your fighter:",
-                            components: [row]
-                        });
-
-                        try {
-                            const confirmation = await response.awaitMessageComponent({ 
-                                filter: i => i.user.id === interaction.user.id, 
-                                time: 60000, 
-                                componentType: ComponentType.StringSelect 
-                            });
-                            
-                            const selectedGroup = (confirmation as StringSelectMenuInteraction).values[0];
-                            const friendlyName = availableCollections.get(selectedGroup) || selectedGroup;
-                            
-                            await confirmation.update({ content: `✅ Selected **${friendlyName}**. Creating lobby...`, components: [] });
-                            
-                            hostPlayer = await validateAndGetPlayerData(interaction.user, type, { 
-                                wallet, 
-                                selectedCollectionGroup: selectedGroup 
-                            });
-                        } catch (e) {
-                            await interaction.editReply({ content: "❌ Selection timed out or failed. Lobby creation cancelled.", components: [] });
-                            return;
-                        }
-                    } else {
-                        throw error;
+                    // If Gang Mode, we require Team A collection for Host
+                    const requiredCollection = setup.mode === 'GANG_MODE' ? setup.teamA!.id : undefined;
+                    
+                    hostPlayer = await validateAndGetPlayerData(interaction.user, setup.type, { 
+                        wallet, 
+                        selectedCollectionGroup,
+                        requiredCollection
+                    });
+                    
+                    if (setup.mode === 'GANG_MODE') {
+                        hostPlayer.team = 'A';
                     }
+
+                } catch (error) {
+                    // If validation fails (e.g. multiple collections or wrong NFT), just create lobby empty
+                    // and tell host to join manually.
+                    console.log("Host auto-join failed:", error);
                 }
             }
 
@@ -705,20 +820,29 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
                 maxPlayers: maxPlayers,
                 status: 'OPEN',
                 settings: {
-                    arena: venue,
-                    genre: mode,
-                    registrationType: type
+                    arena: setup.venue,
+                    genre: setup.mode,
+                    registrationType: setup.type,
+                    teamA: setup.teamA ? { name: setup.teamA.name, collectionId: setup.teamA.id } : undefined,
+                    teamB: setup.teamB ? { name: setup.teamB.name, collectionId: setup.teamB.id } : undefined
                 }
             };
 
             activeLobbies.set(channelId, lobby);
+            pendingLobbySetup.delete(userId); // Cleanup
 
-            const playerList = lobby.players.length > 0 ? `**1.** ${lobby.players[0].username}` : 'Waiting for host to join...';
+            const playerList = lobby.players.length > 0 ? `**1.** ${lobby.players[0].username} ${lobby.players[0].team ? `(${lobby.players[0].team})` : ''}` : 'Waiting for host to join...';
             const thumbnail = lobby.players.length > 0 ? lobby.players[0].avatarUrl : undefined;
 
+            let description = `**Host:** ${interaction.user.username}\n**Type:** ${setup.type}\n**Players:** ${lobby.players.length}/${maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`;
+            
+            if (setup.mode === 'GANG_MODE') {
+                description = `**Host:** ${interaction.user.username}\n**Mode:** Gang War\n**Matchup:** ${setup.teamA!.name} 🆚 ${setup.teamB!.name}\n**Players:** ${lobby.players.length}/${maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to pick your side!`;
+            }
+
             const embed = new EmbedBuilder()
-                .setTitle(`⚔️ ${mode.replace('_', ' ')}: ${venue}`)
-                .setDescription(`**Host:** ${interaction.user.username}\n**Type:** ${type}\n**Players:** ${lobby.players.length}/${maxPlayers}\n\n**Registered Fighters:**\n${playerList}\n\nType \`/battle join\` to enter!`)
+                .setTitle(`⚔️ ${setup.mode.replace('_', ' ')}: ${setup.venue}`)
+                .setDescription(description)
                 .addFields(
                     { name: '📜 Rules', value: '• Online players beat offline players.\n• NFT Stats based on rarity traits.' },
                     { name: '🎮 Commands', value: '• \`/battle join\` - Join Lobby\n• \`/wallet set\` - Link Wallet' }
@@ -729,8 +853,10 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
 
             await interaction.editReply({ embeds: [embed] });
 
-            if (type === 'UPLOAD') {
+            if (setup.type === 'UPLOAD') {
                 await interaction.followUp({ content: `✅ **Lobby Created!** Host, please use \`/battle join image:<attachment>\` to register your fighter!`, ephemeral: true });
+            } else if (!hostPlayer) {
+                 await interaction.followUp({ content: `✅ **Lobby Created!** Host, please use \`/battle join\` to register your fighter! (Auto-join failed or required manual selection)`, ephemeral: true });
             }
 
         } catch (error: any) {

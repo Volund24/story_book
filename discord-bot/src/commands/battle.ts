@@ -793,17 +793,39 @@ export async function handleInteraction(interaction: StringSelectMenuInteraction
                 }
 
                 try {
-                    // If Gang Mode, we require Team A collection for Host
-                    const requiredCollection = setup.mode === 'GANG_MODE' ? setup.teamA!.id : undefined;
-                    
-                    hostPlayer = await validateAndGetPlayerData(interaction.user, setup.type, { 
-                        wallet, 
-                        selectedCollectionGroup,
-                        requiredCollection
-                    });
-                    
                     if (setup.mode === 'GANG_MODE') {
-                        hostPlayer.team = 'A';
+                        // Try Team A first
+                        try {
+                            hostPlayer = await validateAndGetPlayerData(interaction.user, setup.type, { 
+                                wallet, 
+                                requiredCollection: setup.teamA!.id
+                            });
+                            hostPlayer.team = 'A';
+                        } catch (e) {
+                            // Try Team B
+                            console.log("Host not in Team A, trying Team B...");
+                            hostPlayer = await validateAndGetPlayerData(interaction.user, setup.type, { 
+                                wallet, 
+                                requiredCollection: setup.teamB!.id
+                            });
+                            hostPlayer.team = 'B';
+                        }
+                    } else {
+                        // Battle Royale: Try to join. If multiple collections, just pick one (suppress error)
+                        try {
+                            hostPlayer = await validateAndGetPlayerData(interaction.user, setup.type, { wallet });
+                        } catch (e) {
+                            if (e instanceof MultipleCollectionsError) {
+                                // Pick the first one available to ensure Host is joined
+                                const firstGroup = e.groups[0];
+                                hostPlayer = await validateAndGetPlayerData(interaction.user, setup.type, { 
+                                    wallet, 
+                                    selectedCollectionGroup: firstGroup 
+                                });
+                            } else {
+                                throw e;
+                            }
+                        }
                     }
 
                 } catch (error) {

@@ -2,6 +2,7 @@ import { TextChannel, EmbedBuilder, AttachmentBuilder } from 'discord.js';
 import { GoogleGenAI } from '@google/genai';
 import PDFDocument from 'pdfkit';
 import Jimp from 'jimp';
+import axios from 'axios';
 
 // --- Types ---
 
@@ -15,6 +16,7 @@ export interface BattlePlayer {
     roundWins: number;
     nftAttributes?: any[]; // For styling based on NFT traits
     teamId?: string; // For Gang Mode
+    desc?: string;   // Analysis of character appearance
 }
 
 export interface BattleSettings {
@@ -86,6 +88,10 @@ export class BattleManager {
         this.status = 'IN_PROGRESS';
         this.round = 1;
         
+        // --- CHARACTER ANALYSIS STEP ---
+        await this.channel.send("🔍 **Analyzing Fighters...** (Ensuring visual consistency)");
+        await this.analyzeFighters();
+
         // Assign Teams for Gang Mode
         if (this.settings.genre === 'GANG_MODE') {
             // Teams are already assigned in addPlayer for Gang Mode
@@ -174,6 +180,47 @@ export class BattleManager {
             console.error("Front Cover Gen Failed", e);
             await this.channel.send("⚠️ Failed to generate cover art.");
         }
+    }
+
+    private async analyzeFighters() {
+         const players = Array.from(this.players.values());
+         const chunkArray = (arr: any[], size: number): any[][] => 
+             arr.length > size ? [arr.slice(0, size), ...chunkArray(arr.slice(size), size)] : [arr];
+
+         // Use batches to avoid overloading the API
+         for (const chunk of chunkArray(players, 3)) {
+             await Promise.all(chunk.map(async (p: BattlePlayer) => {
+                 try {
+                     // Check if we already did analysis (e.g. reused player object)
+                     if (p.desc) return;
+
+                     // Use NFT traits if available for better text
+                     if (p.nftAttributes && p.nftAttributes.length > 0) {
+                         const traits = p.nftAttributes.map(a => `${a.trait_type}: ${a.value}`).join(', ');
+                         p.desc = `${p.gender} warrior. ${traits}.`;
+                     } else {
+                         // Vision API Analysis
+                         const imgB64 = await this.fetchImageAsBase64(p.avatarUrl);
+                         if (!imgB64) {
+                             p.desc = `${p.gender} warrior named ${p.username}.`;
+                             return;
+                         }
+
+                         const res = await this.genAI.models.generateContent({
+                             model: "gemini-1.5-flash", 
+                             contents: [
+                                 { text: "Describe this character's visual appearance (Hair, Eyes, Clothing, Accessories) in under 20 words:" },
+                                 { inlineData: { mimeType: 'image/jpeg', data: imgB64 } }
+                             ]
+                         });
+                         p.desc = res.text ? res.text.trim() : `${p.gender} fighter.`;
+                     }
+                 } catch (e) {
+                     console.error(`Analysis failed for ${p.username}`, e);
+                     p.desc = `${p.gender} warrior named ${p.username}.`;
+                 }
+             }));
+         }
     }
 
     private generateBracket() {
@@ -298,10 +345,8 @@ export class BattleManager {
             // --- SCENE 2: ACTION SEQUENCE ---
             let { narrative, imageUrl } = await this.generateActionSequence(p1, p2);
 
-            // Overlay Text on Image
-            if (imageUrl && imageUrl.startsWith('data:image')) {
-                imageUrl = await this.overlayComicText(imageUrl, narrative);
-            }
+            // Overlay Text removed for Discord display (Clean Art only)
+            // Text will be added to PDF later.
 
             // Determine Round Winner (Narrative only unless it's the final round)
             // For simplicity, we just narrate the exchange.
@@ -427,15 +472,15 @@ export class BattleManager {
         // 1. Generate Narrative
         const narrativePrompt = `
         Write a short, intense battle scene (max 50 words) between two fighters in a ${this.settings.arena} (${this.settings.genre} style).
-        Fighter 1: ${p1.username} (Gender: ${p1.gender})
-        Fighter 2: ${p2.username} (Gender: ${p2.gender})
+        Fighter 1: ${p1.username} (${p1.desc || p1.gender})
+        Fighter 2: ${p2.username} (${p2.desc || p2.gender})
         Describe the action vividly. Who strikes first? What is the clash like?
         `;
         
         let narrative = "The fighters clash!";
         try {
             const textRes = await this.genAI.models.generateContent({
-                model: "gemini-2.0-flash-exp", // Updated to valid model
+                model: "gemini-2.0-flash-exp", 
                 contents: narrativePrompt
             });
             // Safely extract text
@@ -455,10 +500,12 @@ export class BattleManager {
                 STYLE: ${this.settings.style} comic book art, dynamic action shot.
                 SCENE: ${narrative}
                 ARENA: ${this.settings.arena}
+                CHARACTERS: Left is ${p1.desc || 'FIGHTER 1'}. Right is ${p2.desc || 'FIGHTER 2'}.
                 INSTRUCTIONS:
                 - Show FIGHTER 1 fighting FIGHTER 2.
                 - Maintain character likeness from references.
                 - High energy, impact lines, dramatic lighting.
+                - CLEAN ART ONLY. NO SPEECH BUBBLES. NO TEXT OVERLAY.
             ` });
 
             const imgRes = await this.genAI.models.generateContent({
@@ -522,6 +569,7 @@ export class BattleManager {
                 console.error("Failed to process reference images:", e);
             }
 
+            /*
             // --- VEO VIDEO PROMPT (Sent immediately) ---
             const opponentsDefeated = winner.roundWins; // Approximate count
             const veoPrompt = `
@@ -539,6 +587,7 @@ export class BattleManager {
             await this.channel.send({ 
                 content: `🎥 **Champion Video Prompt (VEO):**\n\`\`\`${veoPrompt}\`\`\`\n*(Copy this prompt to generate your video!)*` 
             });
+            */
 
             try {
                 // 1. Generate Victory Montage (3-panel)
@@ -649,42 +698,80 @@ export class BattleManager {
             });
         });
 
-        // Collect all pages: Front Cover + History (H2H + Action) + Victory Pages
-        const allImages: string[] = [];
-        
-        if (this.frontCoverUrl) allImages.push(this.frontCoverUrl);
-        
-        for (const round of this.history) {
-            if (round.headToHeadUrl) allImages.push(round.headToHeadUrl);
-            if (round.imageUrl) allImages.push(round.imageUrl);
-        }
-        
-        // Add victory pages
-        allImages.push(...this.victoryPages);
-
-        if (allImages.length === 0) {
-            await this.channel.send("⚠️ No images to compile for PDF.");
-            return;
-        }
-
-        for (const imgData of allImages) {
-            if (!imgData.startsWith('data:image')) continue;
+        // Helper function to process and add a page
+        const addPageToPdf = async (imgData: string, caption?: string) => {
+            if (!imgData.startsWith('data:image')) return;
             
             let imgBuffer = Buffer.from(imgData.split(',')[1], 'base64');
             
             try {
                 // Compress image using Jimp to reduce PDF size
                 const image = await Jimp.read(imgBuffer);
-                image.resize(600, Jimp.AUTO); // Resize width to 600px
-                image.quality(60); // Set JPEG quality to 60%
+                image.resize(600, Jimp.AUTO); // Resize width to 600px, maintain aspect ratio
+                image.quality(70); // Set JPEG quality
                 imgBuffer = await image.getBufferAsync(Jimp.MIME_JPEG) as any;
             } catch (e) {
                 console.error("Error compressing image:", e);
                 // Fallback to original buffer if compression fails
             }
             
+            // Standard Comic Page Size (approx 2:3 ratio) -> 6x9 inches like -> 480x720 pts
             doc.addPage({ size: [480, 720], margin: 0 });
-            doc.image(imgBuffer, 0, 0, { width: 480, height: 720 });
+            
+            // Draw Image (Use fit to avoid squishing/stretching if aspect ratio differs)
+            doc.image(imgBuffer, 0, 0, { fit: [480, 720], align: 'center', valign: 'center' });
+
+            // Draw Caption / Narrative Text Overlay
+            if (caption) {
+                // Background Box for text
+                const footerHeight = 140;
+                const bottomY = 720 - footerHeight;
+                
+                doc.save();
+                
+                // Semi-transparent white box at the bottom
+                doc.rect(0, bottomY, 480, footerHeight)
+                   .fillOpacity(0.8)
+                   .fill('white');
+                
+                // Text styling
+                doc.fillOpacity(1.0)
+                   .fill('black')
+                   .font('Helvetica-Bold') // Standard font, no need to load custom for now
+                   .fontSize(12);
+
+                // Add text with padding
+                doc.text(caption, 20, bottomY + 20, {
+                    width: 440,
+                    align: 'center',
+                    lineGap: 4
+                });
+                
+                doc.restore();
+            }
+        };
+
+        // 1. Front Cover
+        if (this.frontCoverUrl) {
+            await addPageToPdf(this.frontCoverUrl);
+        }
+        
+        // 2. Battle History Pages
+        for (const round of this.history) {
+            // Head to Head page (No caption usually, or maybe "Round X")
+            if (round.headToHeadUrl) {
+                await addPageToPdf(round.headToHeadUrl, `Round ${round.roundNumber} - FIGHT!`);
+            }
+            
+            // Battle Action page (With Narrative)
+            if (round.imageUrl) {
+                await addPageToPdf(round.imageUrl, round.narrative);
+            }
+        }
+        
+        // 3. Victory Pages
+        for (const vUrl of this.victoryPages) {
+            await addPageToPdf(vUrl, "WINNER!");
         }
 
         doc.end();
